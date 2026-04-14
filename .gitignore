@@ -1,0 +1,31 @@
+# Ignore everything by default; this repo is scoped to the PyTorch SINDy version.
+/*
+
+# Keep repository metadata and PyTorch SINDy implementation/docs/examples.
+!/.gitignore
+!/sparsedynamics_pytorch/
+!/sparsedynamics_pytorch/**
+
+# Exclude generated Python artifacts.
+**/__pycache__/
+*.py[cod]
+
+# Exclude generated example outputs and local Python packaging/tool artifacts.
+sparsedynamics_pytorch/figures/
+sparsedynamics_pytorch/.venv/
+sparsedynamics_pytorch/venv/
+sparsedynamics_pytorch/env/
+sparsedynamics_pytorch/build/
+sparsedynamics_pytorch/dist/
+sparsedynamics_pytorch/*.egg-info/
+sparsedynamics_pytorch/.pytest_cache/
+sparsedynamics_pytorch/.mypy_cache/
+sparsedynamics_pytorch/.ruff_cache/
+sparsedynamics_pytorch/.coverage
+sparsedynamics_pytorch/htmlcov/
+
+# Exclude common local/editor metadata.
+.DS_Store
+.vscode/
+.idea/
+.obsidian/
