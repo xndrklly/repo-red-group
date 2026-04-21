@@ -15,6 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .trajectory_gradients import (
+    assign_flat_gradients,
+    manual_trajectory_loss_and_gradients,
+    validate_trajectory_gradient_method,
+)
+
 
 class SparseOptimizer:
     """Gradient-based optimizer for SINDy coefficient matrix Xi.
@@ -79,6 +85,7 @@ class SparseOptimizer:
         x0: Tensor,
         t: Tensor,
         x_true: Tensor,
+        gradient_method: str = "autograd",
     ) -> Dict[str, float]:
         """One optimization step minimizing ||x_pred - x_true||^2 + lambda*||Xi||_1.
 
@@ -95,17 +102,34 @@ class SparseOptimizer:
             Time points.
         x_true : Tensor, shape (n_times, n_states) or (n_times, batch, n_states)
             True trajectories at the time points.
+        gradient_method : {"autograd", "sensitivity", "adjoint"}
+            Gradient computation backend for trajectory matching.
 
         Returns
         -------
         dict with keys 'total', 'mse', 'l1'.
         """
+        validate_trajectory_gradient_method(gradient_method)
         self.optimizer.zero_grad()
-        x_pred = ode_model(x0, t)
-        mse_loss = F.mse_loss(x_pred, x_true)
-        l1_loss = self.l1_lambda * self.xi.abs().sum()
+        if gradient_method == "autograd":
+            x_pred = ode_model(x0, t)
+            mse_loss = F.mse_loss(x_pred, x_true)
+            l1_loss = self.l1_lambda * self.xi.abs().sum()
+            total_loss = mse_loss + l1_loss
+            total_loss.backward()
+        else:
+            mse_loss, flat_grad = manual_trajectory_loss_and_gradients(
+                ode_model,
+                x0,
+                t,
+                x_true,
+                [self.xi],
+                gradient_method,
+            )
+            assign_flat_gradients([self.xi], flat_grad)
+            l1_loss = self.l1_lambda * self.xi.abs().sum()
+            self.xi.grad.add_(self.l1_lambda * torch.sign(self.xi.detach()))
         total_loss = mse_loss + l1_loss
-        total_loss.backward()
         self.optimizer.step()
         return {
             "total": total_loss.item(),

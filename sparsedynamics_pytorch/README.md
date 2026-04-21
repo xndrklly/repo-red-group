@@ -111,7 +111,7 @@ dz/dt = xy - 2.6667*z
 
 ## Gradient-Based Trajectory Matching
 
-`SparseOptimizer` can also train the coefficient matrix `xi` with PyTorch gradients. It defaults to Adam. Recompute `theta`, `dx`, and the STLS warm start using the same library as the trainable model:
+`SparseOptimizer` can also train the coefficient matrix `xi` with PyTorch gradients. It defaults to Adam. For trajectory matching, choose `gradient_method="autograd"`, `"sensitivity"`, or `"adjoint"`. Recompute `theta`, `dx`, and the STLS warm start using the same library as the trainable model:
 
 This snippet assumes you have already generated `x_true`, `t_train`, `lorenz_rhs`, and `x0` as in `examples/ex03_lorenz_trainable.py`.
 
@@ -134,10 +134,18 @@ optimizer = sindy_torch.SparseOptimizer(
 )
 
 for epoch in range(50):
-    losses = optimizer.step_trajectory_matching(ode_model, x0, t_train, x_true)
+    losses = optimizer.step_trajectory_matching(
+        ode_model,
+        x0,
+        t_train,
+        x_true,
+        gradient_method="sensitivity",
+    )
 
 optimizer.threshold(tol=0.05)
 ```
+
+`gradient_method="sensitivity"` and `"adjoint"` are explicit trajectory-gradient implementations in this package. `ODEModel(use_adjoint=True)` is separate: it switches the autograd backend inside `torchdiffeq` and only affects `gradient_method="autograd"`.
 
 ---
 
@@ -173,9 +181,14 @@ Generated plot files:
 - `figures/linear2d_method_comparison.png`
 - `figures/linear2d_error_comparison.png`
 - `figures/linear2d_loss_epoch.png`
-- `figures/lorenz_method_comparison.png`
-- `figures/lorenz_error_comparison.png`
-- `figures/lorenz_loss_epoch.png`
+- `figures/lorenz_sindy_method_comparison.png`
+- `figures/lorenz_neural_ode_method_comparison.png`
+- `figures/lorenz_sindy_loss_epoch.png`
+- `figures/lorenz_neural_ode_loss_epoch.png`
+- `figures/lorenz_sindy_butterfly_3d_grid.png`
+- `figures/lorenz_neural_ode_butterfly_3d_grid.png`
+- `figures/lorenz_*_butterfly_3d.png`
+- `figures/lorenz_method_summary.csv`
 - `figures/lorenz_trainable_loss_epoch.png`
 - `figures/neural_ode_linear2d_loss_epoch.png`
 
@@ -203,6 +216,7 @@ sparsedynamics_pytorch/
 |   `-- compare_methods_lorenz.py
 `-- tests/
     |-- verify_against_matlab.py
+    |-- verify_trajectory_gradients.py
     `-- matlab_reference/   # MATLAB-generated .mat fixtures
 ```
 
@@ -257,14 +271,16 @@ dx/dt = g_theta(x)
 
 `ODEModel(dynamics_module, method="dopri5", use_adjoint=False)` wraps `torchdiffeq.odeint` so any dynamics module with `forward(t, x) -> dx/dt` can be integrated as an ODE. The old `sindy_module=` keyword still works for SINDy code.
 
+When `use_adjoint=True`, `ODEModel` switches to `torchdiffeq`'s adjoint-backprop solver for the autograd training path. This is distinct from the explicit `gradient_method="adjoint"` option on the optimizers.
+
 `SparseOptimizer` is for sparse SINDy coefficient training and defaults to Adam. It supports:
 
 - `step_derivative_matching(theta, dxdt)`: minimize derivative prediction error plus an L1 penalty on `xi`
-- `step_trajectory_matching(ode_model, x0, t, x_true)`: integrate the learned ODE and minimize trajectory error plus an L1 penalty
+- `step_trajectory_matching(ode_model, x0, t, x_true, gradient_method="autograd")`: integrate the learned ODE and minimize trajectory error plus an L1 penalty, using autograd, explicit sensitivity, or explicit adjoint gradients
 - `threshold(tol)`: hard sparsification
 - `proximal_step()`: soft thresholding for ISTA-style proximal gradient descent
 
-`GradientOptimizer` is model-agnostic and also defaults to Adam. It supports derivative matching and trajectory matching for any trainable dynamics module, including `NeuralODEModule`.
+`GradientOptimizer` is model-agnostic and also defaults to Adam. It supports derivative matching and trajectory matching for any trainable dynamics module, including `NeuralODEModule`, with the same `gradient_method` options for trajectory training.
 
 ---
 
@@ -301,6 +317,12 @@ The checks cover:
 - STLS sparsity pattern agreement with MATLAB
 - STLS coefficient values within `1e-3` for the synthetic, noisy Linear 2D, and Lorenz fixture comparisons
 - Expected Linear 2D and Lorenz coefficients within the tolerances used in `tests/verify_against_matlab.py`
+
+Trajectory-gradient verification for the explicit `sensitivity` and `adjoint` backends:
+
+```powershell
+python tests\verify_trajectory_gradients.py
+```
 
 If MATLAB is installed and you want to regenerate the fixtures, run this from the repository root:
 

@@ -35,7 +35,9 @@ class ODEModel(nn.Module):
     use_adjoint : bool
         If True, use the adjoint method for O(1)-memory backpropagation.
         Important for large systems where standard backprop through the
-        solver is too memory-intensive.
+        solver is too memory-intensive. This only affects the autograd
+        training path. It is distinct from the explicit
+        gradient_method="adjoint" option on the optimizer helpers.
     """
 
     def __init__(

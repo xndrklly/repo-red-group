@@ -12,6 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .trajectory_gradients import (
+    assign_flat_gradients,
+    manual_trajectory_loss_and_gradients,
+    validate_trajectory_gradient_method,
+)
+
 
 class GradientOptimizer:
     """Model-agnostic optimizer for differentiable dynamics.
@@ -91,12 +97,37 @@ class GradientOptimizer:
         x0: Tensor,
         t: Tensor,
         x_true: Tensor,
+        gradient_method: str = "autograd",
     ) -> Dict[str, float]:
-        """One step minimizing MSE(ode_model(x0, t), x_true)."""
+        """One step minimizing MSE(ode_model(x0, t), x_true).
+
+        Parameters
+        ----------
+        gradient_method : {"autograd", "sensitivity", "adjoint"}
+            Gradient computation backend for trajectory matching.
+        """
+        validate_trajectory_gradient_method(gradient_method)
         self.optimizer.zero_grad()
-        x_pred = ode_model(x0, t)
-        mse_loss = F.mse_loss(x_pred, x_true)
-        total_loss, regularization_loss = self._add_regularization(mse_loss)
-        total_loss.backward()
+        if gradient_method == "autograd":
+            x_pred = ode_model(x0, t)
+            mse_loss = F.mse_loss(x_pred, x_true)
+            total_loss, regularization_loss = self._add_regularization(mse_loss)
+            total_loss.backward()
+        else:
+            mse_loss, flat_grad = manual_trajectory_loss_and_gradients(
+                ode_model,
+                x0,
+                t,
+                x_true,
+                self.params,
+                gradient_method,
+            )
+            assign_flat_gradients(self.params, flat_grad)
+            total_loss = mse_loss
+            regularization_loss = None
+            if self.regularization is not None:
+                regularization_loss = self.regularization()
+                total_loss = total_loss + regularization_loss
+                regularization_loss.backward()
         self.optimizer.step()
         return self._loss_dict(total_loss, mse_loss, regularization_loss)

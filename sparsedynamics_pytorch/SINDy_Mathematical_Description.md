@@ -156,7 +156,13 @@ where the predicted trajectory is obtained by integrating the discovered ODE:
 
 $$\hat{\mathbf{X}}(\boldsymbol{\Xi}) = \text{ODESolve}\left( \frac{d\mathbf{x}}{dt} = \boldsymbol{\Theta}(\mathbf{x}) \, \boldsymbol{\Xi}, \; \mathbf{x}_0, \; t \right)$$
 
-The gradient d(loss)/d(**Xi**) is computed by backpropagating through the ODE solver via the adjoint sensitivity method (Chen et al., 2018) or direct backpropagation.
+For trajectory matching, this package supports three gradient backends:
+
+- `gradient_method="autograd"`: standard PyTorch backpropagation through the ODE solve
+- `gradient_method="sensitivity"`: an explicit forward sensitivity solve on the augmented state `(x, S_theta)`
+- `gradient_method="adjoint"`: an explicit reverse-time adjoint solve with parameter-gradient accumulation
+
+`ODEModel(use_adjoint=True)` only changes the backend used by `gradient_method="autograd"`; it is not the same as the explicit `gradient_method="adjoint"` option.
 
 **Proximal gradient descent (ISTA):** In a proximal-style training loop, after each gradient step on the MSE term, apply soft thresholding:
 
@@ -212,13 +218,19 @@ Implemented in `SINDyModule.forward`, `NeuralODEModule.forward`, and `ODEModel.f
 
 ---
 
-## 6. Adjoint Sensitivity Method
+## 6. Trajectory Gradient Methods
 
-For the trajectory matching objective, gradients must flow backward through the ODE solver. Two approaches are available:
+For the trajectory matching objective, gradients must flow through the ODE solver. Three approaches are available:
 
 **Direct backpropagation:** Store all intermediate ODE solver states and backpropagate through them. Memory cost: O(L) where L is the number of solver steps. Suitable for small systems.
 
-**Adjoint method** (Chen et al., 2018): Augments the system with an adjoint ODE that propagates gradients backward in time. Memory cost: O(1) regardless of the number of solver steps. The adjoint state **a**(t) = d(loss)/d(**x**(t)) satisfies:
+**Explicit sensitivity method:** Propagate the state and parameter sensitivities forward together:
+
+$$\frac{d\mathbf{S}_{\theta}}{dt} = \frac{\partial \mathbf{f}}{\partial \mathbf{x}} \mathbf{S}_{\theta} + \frac{\partial \mathbf{f}}{\partial \boldsymbol{\theta}}$$
+
+where $\mathbf{S}_{\theta}(t) = \partial \mathbf{x}(t) / \partial \boldsymbol{\theta}$. After the forward solve, the parameter gradient is assembled by contracting $\mathbf{S}_{\theta}(t_n)$ with $\partial \mathcal{L} / \partial \mathbf{x}(t_n)$ at the sampled times.
+
+**Explicit adjoint method:** Augment the system with an adjoint ODE that propagates gradients backward in time. The adjoint state **a**(t) = d(loss)/d(**x**(t)) satisfies:
 
 $$\frac{d\mathbf{a}}{dt} = -\left(\frac{\partial \mathbf{f}}{\partial \mathbf{x}}\right)^T \mathbf{a}$$
 
@@ -226,7 +238,7 @@ and parameter gradients are accumulated as:
 
 $$\frac{d \, \text{loss}}{d \boldsymbol{\theta}} = -\int_{t_1}^{t_0} \mathbf{a}(t)^T \frac{\partial \mathbf{f}}{\partial \boldsymbol{\theta}} \, dt$$
 
-Enabled via `ODEModel(use_adjoint=True)`. Essential for large-scale systems where direct backpropagation would exhaust memory.
+In this codebase, `gradient_method="adjoint"` implements an explicit sampled-checkpoint reverse solve. Separately, `ODEModel(use_adjoint=True)` enables `torchdiffeq`'s adjoint-backprop implementation for the autograd path. The two approaches share the same mathematical objective but are different implementations.
 
 ---
 
