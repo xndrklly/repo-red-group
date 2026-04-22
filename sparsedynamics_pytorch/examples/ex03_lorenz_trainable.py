@@ -10,6 +10,7 @@ Pipeline:
     -> backprop -> update Xi
 """
 
+import argparse
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -19,8 +20,8 @@ import sindy_torch
 from example_plotting import figures_dir, save_loss_plot
 
 
-def main():
-    device = sindy_torch.get_device()
+def main(device_arg: str = "auto"):
+    device = sindy_torch.get_device(device_arg)
     print(f"Device: {device}")
 
     # --- Generate true Lorenz trajectory ---
@@ -98,7 +99,7 @@ def main():
     print(f"\nSparsity: {model.sparsity()*100:.0f}% zero coefficients")
 
     # --- Verify ---
-    xi_final = model.xi.detach().cpu().numpy()
+    xi_final = sindy_torch.as_numpy(model.xi)
     print("\n--- Key coefficients ---")
     labels = library.get_labels(["x", "y", "z"])
     for i in range(xi_final.shape[0]):
@@ -118,4 +119,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    main(args.device)

@@ -32,4 +32,4 @@ from .differentiation import finite_difference_4th, autograd_derivative, tv_reg_
 from .systems import lorenz, hopf, logistic
 
 # Utilities
-from .utils import get_device, to_tensor
+from .utils import add_device_arg, as_numpy, get_device, to_tensor

@@ -27,6 +27,7 @@ For the math behind the implementation, see [`SINDy_Mathematical_Description.md`
 - NumPy and SciPy
 - Matplotlib for the plotting examples
 - MATLAB is optional, only needed to regenerate the reference fixtures
+- CUDA is optional and requires a CUDA-enabled PyTorch installation
 
 ## Installation
 
@@ -47,12 +48,29 @@ For macOS/Linux shells, the activation command is:
 source .venv/bin/activate
 ```
 
+## Device Selection
+
+Runnable examples and verification scripts accept a shared device flag:
+
+```powershell
+python examples\quickstart_lorenz.py --device auto
+python examples\quickstart_lorenz.py --device cpu
+python examples\quickstart_lorenz.py --device cuda
+```
+
+`--device auto` is the default and uses CUDA when `torch.cuda.is_available()` is true; otherwise it falls back to CPU. Passing `--device cuda` fails early with a clear error if the local PyTorch build cannot use CUDA. The long Lorenz comparison defaults to 4 CPU workers on CPU and 1 serial worker on CUDA:
+
+```powershell
+python examples\compare_methods_lorenz.py --device cuda
+python examples\compare_methods_lorenz.py --device cpu --max-workers 4
+```
+
 ## Quick Start
 
 Run the checked example after installing the package:
 
 ```powershell
-python examples\quickstart_lorenz.py
+python examples\quickstart_lorenz.py --device auto
 ```
 
 The example identifies the Lorenz equations from simulated trajectory data and checks the 7 expected nonzero coefficients.
@@ -160,7 +178,7 @@ dx/dt = g_theta(x)
 `GradientOptimizer` trains any dynamics module with PyTorch gradients and defaults to Adam. The included example trains a Neural ODE on derivative data from the same Linear 2D system used in the SINDy examples:
 
 ```powershell
-python examples\ex04_neural_ode_linear2d.py
+python examples\ex04_neural_ode_linear2d.py --device auto
 ```
 
 ---
@@ -170,10 +188,10 @@ python examples\ex04_neural_ode_linear2d.py
 The plotting examples save PNG files in `figures/`. The comparison scripts run multiple methods on the same data, while the standalone gradient examples save their own loss-vs-epoch plots:
 
 ```powershell
-python examples\compare_methods_linear2d.py
-python examples\compare_methods_lorenz.py
-python examples\ex03_lorenz_trainable.py
-python examples\ex04_neural_ode_linear2d.py
+python examples\compare_methods_linear2d.py --device auto
+python examples\compare_methods_lorenz.py --device auto
+python examples\ex03_lorenz_trainable.py --device auto
+python examples\ex04_neural_ode_linear2d.py --device auto
 ```
 
 Generated plot files:
@@ -294,6 +312,8 @@ Three methods are available:
 | `autograd_derivative(ode, x0, t)` | Known ODE, usually synthetic data | None |
 | `tv_reg_diff(data, n_iter, alpha)` | Noisy data | 0-1 samples |
 
+`tv_reg_diff` uses SciPy/NumPy internally, so it performs its differentiation work on CPU and returns the result on the input tensor's original device.
+
 ---
 
 ## MATLAB Verification
@@ -301,7 +321,7 @@ Three methods are available:
 The normal verification command does not require MATLAB. It compares PyTorch outputs against MATLAB-generated `.mat` fixtures in `tests/matlab_reference/`.
 
 ```powershell
-python tests\verify_against_matlab.py
+python tests\verify_against_matlab.py --device auto
 ```
 
 Current verification result:
@@ -321,8 +341,11 @@ The checks cover:
 Trajectory-gradient verification for the explicit `sensitivity` and `adjoint` backends:
 
 ```powershell
-python tests\verify_trajectory_gradients.py
+python tests\verify_trajectory_gradients.py --device auto
+python tests\verify_cuda_optional.py
 ```
+
+`verify_cuda_optional.py` runs CUDA smoke checks when CUDA is available and reports skipped CUDA checks on CPU-only installations.
 
 If MATLAB is installed and you want to regenerate the fixtures, run this from the repository root:
 

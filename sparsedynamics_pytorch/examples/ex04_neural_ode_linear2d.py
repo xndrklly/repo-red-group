@@ -5,6 +5,7 @@ This example uses the model-agnostic GradientOptimizer with Adam to train a
 NeuralODEModule on derivative data, then integrates the learned dynamics.
 """
 
+import argparse
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -14,8 +15,8 @@ import sindy_torch
 from example_plotting import figures_dir, save_loss_plot
 
 
-def main():
-    device = sindy_torch.get_device()
+def main(device_arg: str = "auto"):
+    device = sindy_torch.get_device(device_arg)
     dtype = torch.float64
     torch.manual_seed(7)
     print(f"Device: {device}")
@@ -74,4 +75,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    main(args.device)

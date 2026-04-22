@@ -7,6 +7,7 @@ True system:
     dz/dt = x*y - beta*z          = x*y - (8/3)*z
 """
 
+import argparse
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -15,8 +16,8 @@ from torchdiffeq import odeint
 import sindy_torch
 
 
-def main():
-    device = sindy_torch.get_device()
+def main(device_arg: str = "auto"):
+    device = sindy_torch.get_device(device_arg)
     print(f"Device: {device}")
 
     # --- Parameters ---
@@ -44,14 +45,14 @@ def main():
     Xi = sindy_torch.stls(Theta, dx, lam=0.025)
 
     # --- Display ---
-    model = sindy_torch.SINDyModule(library, library.n_features, n)
+    model = sindy_torch.SINDyModule(library, library.n_features, n).to(device)
     model.set_xi(Xi)
     print(f"\nSparsity: {model.sparsity()*100:.0f}% zero coefficients")
     print("\nDiscovered Lorenz system:")
     model.print_equations(["x", "y", "z"])
 
     # --- Check coefficients ---
-    xi_np = Xi.numpy()
+    xi_np = sindy_torch.as_numpy(Xi)
     checks = [
         ("sigma (x in dx/dt)", xi_np[1, 0], -sigma),
         ("sigma (y in dx/dt)", xi_np[2, 0], sigma),
@@ -76,4 +77,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    main(args.device)

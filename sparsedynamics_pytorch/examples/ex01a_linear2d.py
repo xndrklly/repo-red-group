@@ -6,17 +6,17 @@ True system:
     dy/dt = -2*x - 0.1*y
 """
 
+import argparse
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-import numpy as np
 from torchdiffeq import odeint
 import sindy_torch
 
 
-def main():
-    device = sindy_torch.get_device()
+def main(device_arg: str = "auto"):
+    device = sindy_torch.get_device(device_arg)
     print(f"Device: {device}")
 
     # --- True system ---
@@ -46,7 +46,7 @@ def main():
     Xi = sindy_torch.stls(Theta, dx, lam=0.05)
 
     # --- Display results ---
-    model = sindy_torch.SINDyModule(library, library.n_features, n)
+    model = sindy_torch.SINDyModule(library, library.n_features, n).to(device)
     model.set_xi(Xi)
     print(f"\nSparsity: {model.sparsity()*100:.0f}% zero coefficients")
     print("\nDiscovered system:")
@@ -68,4 +68,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    main(args.device)

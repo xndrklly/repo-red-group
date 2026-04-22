@@ -4,6 +4,7 @@ Verification tests for explicit sensitivity and adjoint trajectory gradients.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
@@ -60,21 +61,21 @@ def gradient_close(reference, candidate, atol=1e-5, rtol=1e-4):
     return abs_err <= atol and rel_err <= rtol, abs_err, rel_err
 
 
-def make_linear_data(dtype=torch.float64):
-    A = torch.tensor([[-0.2, 1.0], [-1.0, -0.3]], dtype=dtype)
+def make_linear_data(device, dtype=torch.float64):
+    A = torch.tensor([[-0.2, 1.0], [-1.0, -0.3]], dtype=dtype, device=device)
     rhs = lambda t, x: x @ A.T
-    x0 = torch.tensor([1.0, -0.5], dtype=dtype)
-    t = torch.linspace(0.0, 0.6, 21, dtype=dtype)
+    x0 = torch.tensor([1.0, -0.5], dtype=dtype, device=device)
+    t = torch.linspace(0.0, 0.6, 21, dtype=dtype, device=device)
     with torch.no_grad():
         x_true = odeint(rhs, x0, t, rtol=1e-10, atol=1e-10)
     dx_true = x_true @ A.T
     return x0, t, x_true, dx_true
 
 
-def build_sindy_model(dtype=torch.float64):
+def build_sindy_model(device, dtype=torch.float64):
     library = sindy_torch.PolynomialLibrary(n_vars=2, poly_order=1)
-    model = sindy_torch.SINDyModule(library, library.n_features, n_states=2)
-    xi = torch.zeros(library.n_features, 2, dtype=dtype)
+    model = sindy_torch.SINDyModule(library, library.n_features, n_states=2).to(device)
+    xi = torch.zeros(library.n_features, 2, dtype=dtype, device=device)
     xi[0, 0] = 0.05
     xi[1, 0] = -0.18
     xi[2, 0] = 0.88
@@ -85,20 +86,21 @@ def build_sindy_model(dtype=torch.float64):
     return model
 
 
-def build_neural_model(dtype=torch.float64):
+def build_neural_model(device, dtype=torch.float64):
     torch.manual_seed(5)
     return sindy_torch.NeuralODEModule(
         n_states=2,
         hidden_width=4,
         hidden_depth=1,
         dtype=dtype,
+        device=device,
     )
 
 
-def test_sindy_gradient_agreement():
+def test_sindy_gradient_agreement(device):
     print("\n=== Test 1: SINDy manual gradients match autograd ===")
-    x0, t, x_true, _ = make_linear_data()
-    model = build_sindy_model()
+    x0, t, x_true, _ = make_linear_data(device)
+    model = build_sindy_model(device)
     ode_model = sindy_torch.ODEModel(model, rtol=1e-8, atol=1e-10)
     params = [model.xi]
 
@@ -127,10 +129,10 @@ def test_sindy_gradient_agreement():
     )
 
 
-def test_neural_gradient_agreement():
+def test_neural_gradient_agreement(device):
     print("\n=== Test 2: Neural ODE manual gradients match autograd ===")
-    x0, t, x_true, _ = make_linear_data()
-    model = build_neural_model()
+    x0, t, x_true, _ = make_linear_data(device)
+    model = build_neural_model(device)
     ode_model = sindy_torch.ODEModel(model, rtol=1e-8, atol=1e-10)
     params = list(model.parameters())
 
@@ -159,12 +161,12 @@ def test_neural_gradient_agreement():
     )
 
 
-def test_manual_training_reduces_sindy_loss():
+def test_manual_training_reduces_sindy_loss(device):
     print("\n=== Test 3: SINDy manual trajectory training reduces loss ===")
-    x0, t, x_true, _ = make_linear_data()
+    x0, t, x_true, _ = make_linear_data(device)
 
     for method in ("sensitivity", "adjoint"):
-        model = build_sindy_model()
+        model = build_sindy_model(device)
         ode_model = sindy_torch.ODEModel(model, rtol=1e-8, atol=1e-10)
         optimizer = sindy_torch.SparseOptimizer(
             model.xi,
@@ -190,12 +192,12 @@ def test_manual_training_reduces_sindy_loss():
         )
 
 
-def test_manual_training_reduces_neural_loss():
+def test_manual_training_reduces_neural_loss(device):
     print("\n=== Test 4: Neural ODE manual trajectory training reduces loss ===")
-    x0, t, x_true, _ = make_linear_data()
+    x0, t, x_true, _ = make_linear_data(device)
 
     for method in ("sensitivity", "adjoint"):
-        model = build_neural_model()
+        model = build_neural_model(device)
         ode_model = sindy_torch.ODEModel(model, rtol=1e-8, atol=1e-10)
         optimizer = sindy_torch.GradientOptimizer(
             model,
@@ -220,10 +222,10 @@ def test_manual_training_reduces_neural_loss():
         )
 
 
-def test_batched_inputs_rejected():
+def test_batched_inputs_rejected(device):
     print("\n=== Test 5: Batched inputs rejected for manual modes ===")
-    x0, t, x_true, _ = make_linear_data()
-    model = build_neural_model()
+    x0, t, x_true, _ = make_linear_data(device)
+    model = build_neural_model(device)
     ode_model = sindy_torch.ODEModel(model, rtol=1e-8, atol=1e-10)
     optimizer = sindy_torch.GradientOptimizer(model, optimizer_kwargs={"lr": 1e-2})
 
@@ -249,12 +251,14 @@ def test_batched_inputs_rejected():
             check(f"Batched {method} error", False, "ValueError not raised")
 
 
-def main():
-    test_sindy_gradient_agreement()
-    test_neural_gradient_agreement()
-    test_manual_training_reduces_sindy_loss()
-    test_manual_training_reduces_neural_loss()
-    test_batched_inputs_rejected()
+def main(device_arg="auto"):
+    device = sindy_torch.get_device(device_arg)
+    print(f"Device: {device}")
+    test_sindy_gradient_agreement(device)
+    test_neural_gradient_agreement(device)
+    test_manual_training_reduces_sindy_loss(device)
+    test_manual_training_reduces_neural_loss(device)
+    test_batched_inputs_rejected(device)
 
     print(f"\n{'=' * 50}")
     print(f"RESULTS: {PASS_COUNT} passed, {FAIL_COUNT} failed")
@@ -267,5 +271,8 @@ def main():
 
 
 if __name__ == "__main__":
-    success = main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    success = main(args.device)
     sys.exit(0 if success else 1)

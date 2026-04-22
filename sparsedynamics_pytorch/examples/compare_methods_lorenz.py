@@ -1,9 +1,9 @@
 """
 Long parallel Lorenz benchmark for SINDy and Neural ODE training methods.
 
-The script trains each method in a separate CPU worker process, then writes
-early-horizon trajectory comparisons, loss curves, and long-horizon 3D
-butterfly plots.
+The script trains each method with CPU process parallelism or serial CUDA
+execution, then writes early-horizon trajectory comparisons, loss curves, and
+long-horizon 3D butterfly plots.
 
 Outputs:
     figures/lorenz_method_summary.csv
@@ -19,6 +19,7 @@ Outputs:
 from __future__ import annotations
 
 import csv
+import argparse
 import math
 import os
 import sys
@@ -42,7 +43,7 @@ from example_plotting import figures_dir, save_loss_plot
 
 SEED = 11
 DTYPE = torch.float64
-MAX_WORKERS = 4
+CPU_DEFAULT_MAX_WORKERS = 4
 WORKER_TORCH_THREADS = 1
 
 EARLY_T_END = 1.0
@@ -124,16 +125,19 @@ def relative_error(x_true: torch.Tensor, x_pred: torch.Tensor) -> float:
     return (torch.norm(x_true - x_pred) / torch.norm(x_true)).item()
 
 
-def as_numpy(x: torch.Tensor):
-    return x.detach().cpu().numpy()
+def as_numpy(x):
+    return sindy_torch.as_numpy(x)
 
 
 def lorenz_rhs(t_i: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return sindy_torch.lorenz(t_i, y, LORENZ_SIGMA, LORENZ_BETA, LORENZ_RHO)
 
 
-def make_lorenz_grid(t_end: float, n_times: int) -> tuple[torch.Tensor, torch.Tensor]:
-    device = torch.device("cpu")
+def make_lorenz_grid(
+    t_end: float,
+    n_times: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     x0 = torch.tensor(LORENZ_X0, dtype=DTYPE, device=device)
     t = torch.linspace(0.0, t_end, n_times, dtype=DTYPE, device=device)
     return x0, t
@@ -144,8 +148,9 @@ def make_lorenz_data(
     n_times: int,
     *,
     with_derivatives: bool,
+    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    x0, t = make_lorenz_grid(t_end, n_times)
+    x0, t = make_lorenz_grid(t_end, n_times, device)
     with torch.no_grad():
         x_true = odeint(lorenz_rhs, x0, t, rtol=1e-10, atol=1e-10)
     dx_true = None
@@ -182,7 +187,7 @@ def build_sindy_model(
     return model
 
 
-def build_neural_model() -> sindy_torch.NeuralODEModule:
+def build_neural_model(device: torch.device) -> sindy_torch.NeuralODEModule:
     # Same seed for every Neural ODE method, so each method starts identically.
     torch.manual_seed(202)
     return sindy_torch.NeuralODEModule(
@@ -190,7 +195,7 @@ def build_neural_model() -> sindy_torch.NeuralODEModule:
         hidden_width=64,
         hidden_depth=2,
         dtype=DTYPE,
-        device=torch.device("cpu"),
+        device=device,
     )
 
 
@@ -203,7 +208,7 @@ def evaluate_model(
 ) -> tuple[torch.Tensor, float, float]:
     with torch.no_grad():
         x_pred = sindy_torch.ODEModel(model, rtol=1e-6, atol=1e-8)(x0, t)
-        dx_pred = model(torch.tensor(0.0, dtype=DTYPE), x_true)
+        dx_pred = model(torch.tensor(0.0, dtype=DTYPE, device=x_true.device), x_true)
     return x_pred, relative_error(x_true, x_pred), F.mse_loss(dx_pred, dx_true).item()
 
 
@@ -222,11 +227,15 @@ def evaluate_long_butterfly(
         return None, f"failed: {type(exc).__name__}"
 
 
-def train_sindy(spec: MethodSpec) -> tuple[torch.nn.Module, list[float], float]:
+def train_sindy(
+    spec: MethodSpec,
+    device: torch.device,
+) -> tuple[torch.nn.Module, list[float], float]:
     x0, t, x_true, dx_true = make_lorenz_data(
         EARLY_T_END,
         EARLY_N_TIMES,
         with_derivatives=True,
+        device=device,
     )
     assert dx_true is not None
     library, theta, xi_stls, xi_init = build_sindy_inputs(x_true, dx_true)
@@ -270,14 +279,18 @@ def train_sindy(spec: MethodSpec) -> tuple[torch.nn.Module, list[float], float]:
     return model, losses, time.perf_counter() - train_start
 
 
-def train_neural(spec: MethodSpec) -> tuple[torch.nn.Module, list[float], float]:
+def train_neural(
+    spec: MethodSpec,
+    device: torch.device,
+) -> tuple[torch.nn.Module, list[float], float]:
     x0, t, x_true, dx_true = make_lorenz_data(
         EARLY_T_END,
         EARLY_N_TIMES,
         with_derivatives=True,
+        device=device,
     )
     assert dx_true is not None
-    model = build_neural_model()
+    model = build_neural_model(device)
     losses: list[float] = []
     train_start = time.perf_counter()
 
@@ -309,8 +322,10 @@ def train_neural(spec: MethodSpec) -> tuple[torch.nn.Module, list[float], float]
     return model, losses, time.perf_counter() - train_start
 
 
-def run_method_worker(spec: MethodSpec) -> dict[str, Any]:
-    configure_worker_threads()
+def run_method_worker(spec: MethodSpec, device_name: str) -> dict[str, Any]:
+    if device_name == "cpu":
+        configure_worker_threads()
+    device = sindy_torch.get_device(device_name)
     torch.manual_seed(SEED)
     start = time.perf_counter()
     row: dict[str, Any] = {
@@ -340,17 +355,19 @@ def run_method_worker(spec: MethodSpec) -> dict[str, Any]:
             EARLY_T_END,
             EARLY_N_TIMES,
             with_derivatives=True,
+            device=device,
         )
         assert dx_true is not None
         x0_long, t_long = make_lorenz_grid(
             LONG_T_END,
             LONG_N_TIMES,
+            device,
         )
 
         if spec.family == "SINDy":
-            model, losses, training_seconds = train_sindy(spec)
+            model, losses, training_seconds = train_sindy(spec, device)
         elif spec.family == "Neural ODE":
-            model, losses, training_seconds = train_neural(spec)
+            model, losses, training_seconds = train_neural(spec, device)
         else:
             raise ValueError(f"Unknown model family {spec.family!r}")
 
@@ -380,16 +397,20 @@ def run_method_worker(spec: MethodSpec) -> dict[str, Any]:
     return result
 
 
-def truth_trajectories() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def truth_trajectories(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, t_early, x_early, _ = make_lorenz_data(
         EARLY_T_END,
         EARLY_N_TIMES,
         with_derivatives=False,
+        device=device,
     )
     _, t_long, x_long, _ = make_lorenz_data(
         LONG_T_END,
         LONG_N_TIMES,
         with_derivatives=False,
+        device=device,
     )
     return t_early, x_early, t_long, x_long
 
@@ -565,12 +586,29 @@ def sort_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(results, key=lambda result: order[(result["family"], result["method"])])
 
 
-def run_parallel_sweep() -> list[dict[str, Any]]:
-    print(f"Running {len(METHOD_SPECS)} methods with max_workers={MAX_WORKERS}")
+def run_parallel_sweep(device: torch.device, max_workers: int) -> list[dict[str, Any]]:
+    device_name = device.type
+    print(f"Running {len(METHOD_SPECS)} methods with max_workers={max_workers}")
     results: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    if max_workers == 1:
+        for spec in METHOD_SPECS:
+            result = run_method_worker(spec, device_name)
+            results.append(result)
+            row = result["row"]
+            print(
+                f"Finished {spec.family} / {spec.method}: "
+                f"{row['status']} in {row['runtime_seconds']:.1f}s"
+            )
+            if result.get("traceback"):
+                print(result["traceback"])
+        return sort_results(results)
+
+    if device_name != "cpu":
+        raise ValueError("Parallel method workers are only supported for CPU runs")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_spec = {
-            executor.submit(run_method_worker, spec): spec
+            executor.submit(run_method_worker, spec, device_name): spec
             for spec in METHOD_SPECS
         }
         for future in as_completed(future_to_spec):
@@ -609,19 +647,29 @@ def run_parallel_sweep() -> list[dict[str, Any]]:
     return sort_results(results)
 
 
-def main():
+def default_max_workers(device: torch.device) -> int:
+    return 1 if device.type == "cuda" else CPU_DEFAULT_MAX_WORKERS
+
+
+def main(device_arg: str = "auto", max_workers: int | None = None):
     torch.manual_seed(SEED)
+    device = sindy_torch.get_device(device_arg)
+    if max_workers is None:
+        max_workers = default_max_workers(device)
+    if max_workers < 1:
+        raise ValueError("--max-workers must be at least 1")
+
     out_dir = figures_dir()
     out_dir.mkdir(exist_ok=True)
-    print("Device: cpu")
+    print(f"Device: {device}")
     print(
         "Long Lorenz benchmark: "
         f"early t=[0,{EARLY_T_END}], long t=[0,{LONG_T_END}], "
-        f"{MAX_WORKERS} workers"
+        f"{max_workers} workers"
     )
 
-    t_early, x_true_early, _, x_true_long = truth_trajectories()
-    results = run_parallel_sweep()
+    t_early, x_true_early, _, x_true_long = truth_trajectories(device)
+    results = run_parallel_sweep(device, max_workers)
 
     rows = []
     for result in results:
@@ -714,4 +762,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Method-level workers. Defaults to 4 on CPU and 1 on CUDA.",
+    )
+    args = parser.parse_args()
+    main(args.device, args.max_workers)

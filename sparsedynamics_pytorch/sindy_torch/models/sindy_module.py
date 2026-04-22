@@ -69,7 +69,7 @@ class SINDyModule(nn.Module):
 
     def predict_derivative(self, x: Tensor) -> Tensor:
         """Convenience: compute dx/dt without the time argument."""
-        return self.forward(torch.tensor(0.0), x)
+        return self.forward(torch.tensor(0.0, device=x.device, dtype=x.dtype), x)
 
     @torch.no_grad()
     def set_xi(self, xi: Tensor):

@@ -13,12 +13,16 @@ Tests:
   4. Lorenz full pipeline (noiseless)
 """
 
+import argparse
+import os
 from pathlib import Path
 import sys
 
 import numpy as np
 from scipy.io import loadmat
 import torch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import sindy_torch
 
@@ -56,16 +60,16 @@ def check(name, condition, detail=""):
         print(f"  FAIL: {name}  {detail}")
 
 
-def test_pool_data_2var():
+def test_pool_data_2var(device):
     print("\n=== Test 1: PolynomialLibrary (2 variables) ===")
     d = loadmat(REF_DIR / "pooldata_test.mat")
     x_np = d["x_test"]  # (3, 2)
-    x_t = torch.tensor(x_np, dtype=torch.float64)
+    x_t = torch.tensor(x_np, dtype=torch.float64, device=device)
 
     for po, key in [(2, "Theta_test_p2"), (3, "Theta_test_p3"), (5, "Theta_test_p5")]:
         theta_matlab = d[key]
         lib = sindy_torch.PolynomialLibrary(2, po)
-        theta_torch = lib(x_t).numpy()
+        theta_torch = sindy_torch.as_numpy(lib(x_t))
 
         check(
             f"shape (polyorder={po})",
@@ -81,14 +85,14 @@ def test_pool_data_2var():
             )
 
 
-def test_pool_data_3var():
+def test_pool_data_3var(device):
     print("\n=== Test 2: PolynomialLibrary (3 variables) ===")
     d = loadmat(REF_DIR / "pooldata_test3.mat")
     x_np = d["x_test3"]
-    x_t = torch.tensor(x_np, dtype=torch.float64)
+    x_t = torch.tensor(x_np, dtype=torch.float64, device=device)
     theta_matlab = d["Theta_test3_p3"]
     lib = sindy_torch.PolynomialLibrary(3, 3)
-    theta_torch = lib(x_t).numpy()
+    theta_torch = sindy_torch.as_numpy(lib(x_t))
 
     check(
         "shape (3var, polyorder=3)",
@@ -104,14 +108,14 @@ def test_pool_data_3var():
         )
 
 
-def test_stls_synthetic():
+def test_stls_synthetic(device):
     print("\n=== Test 3: STLS (synthetic problem) ===")
     d = loadmat(REF_DIR / "sparse_small.mat")
-    theta = torch.tensor(d["Theta_small"], dtype=torch.float64)
-    dx = torch.tensor(d["dx_small"], dtype=torch.float64)
+    theta = torch.tensor(d["Theta_small"], dtype=torch.float64, device=device)
+    dx = torch.tensor(d["dx_small"], dtype=torch.float64, device=device)
     xi_matlab = d["Xi_small"]
 
-    xi_torch = sindy_torch.stls(theta, dx, lam=0.1).numpy()
+    xi_torch = sindy_torch.as_numpy(sindy_torch.stls(theta, dx, lam=0.1))
 
     sp_ml = xi_matlab != 0
     sp_pt = np.abs(xi_torch) > 1e-12
@@ -134,12 +138,12 @@ def test_stls_synthetic():
                 )
 
 
-def test_linear2d():
+def test_linear2d(device):
     print("\n=== Test 4: Linear 2D full pipeline ===")
     d = loadmat(REF_DIR / "linear2d.mat")
-    x = torch.tensor(d["x"], dtype=torch.float64)
-    dx_true = torch.tensor(d["dx_true"], dtype=torch.float64)
-    dx_noisy = torch.tensor(d["dx"], dtype=torch.float64)
+    x = torch.tensor(d["x"], dtype=torch.float64, device=device)
+    dx_true = torch.tensor(d["dx_true"], dtype=torch.float64, device=device)
+    dx_noisy = torch.tensor(d["dx"], dtype=torch.float64, device=device)
     theta_matlab = d["Theta"]
     xi_matlab = d["Xi"]
     polyorder = int(d["polyorder"].item())
@@ -147,27 +151,30 @@ def test_linear2d():
     n = int(d["n"].item())
 
     lib = sindy_torch.PolynomialLibrary(n, polyorder)
-    theta_torch = lib(x).numpy()
+    theta_tensor = lib(x)
+    theta_torch = sindy_torch.as_numpy(theta_tensor)
     check("Theta shape", theta_torch.shape == theta_matlab.shape)
     if theta_torch.shape == theta_matlab.shape:
         max_err = np.max(np.abs(theta_torch - theta_matlab))
         check("Theta values", max_err < 1e-10, f"max err={max_err:.2e}")
 
     xi_noiseless = sindy_torch.stls(
-        torch.tensor(theta_torch, dtype=torch.float64),
+        theta_tensor,
         dx_true,
         lam=lam,
-    ).numpy()
+    )
+    xi_noiseless = sindy_torch.as_numpy(xi_noiseless)
     check("noiseless: x coeff (col 0)", abs(xi_noiseless[1, 0] - (-0.1)) < 0.001)
     check("noiseless: y coeff (col 0)", abs(xi_noiseless[2, 0] - 2.0) < 0.001)
     check("noiseless: x coeff (col 1)", abs(xi_noiseless[1, 1] - (-2.0)) < 0.001)
     check("noiseless: y coeff (col 1)", abs(xi_noiseless[2, 1] - (-0.1)) < 0.001)
 
     xi_noisy = sindy_torch.stls(
-        torch.tensor(theta_torch, dtype=torch.float64),
+        theta_tensor,
         dx_noisy,
         lam=lam,
-    ).numpy()
+    )
+    xi_noisy = sindy_torch.as_numpy(xi_noisy)
     sp_py = np.abs(xi_noisy) > 1e-10
     sp_ml = np.abs(xi_matlab) > 1e-10
     check("noisy: sparsity pattern", np.array_equal(sp_py, sp_ml))
@@ -184,11 +191,11 @@ def test_linear2d():
                 )
 
 
-def test_lorenz():
+def test_lorenz(device):
     print("\n=== Test 5: Lorenz full pipeline (noiseless) ===")
     d = loadmat(REF_DIR / "lorenz.mat")
-    x_lor = torch.tensor(d["x_lor"], dtype=torch.float64)
-    dx_lor = torch.tensor(d["dx_lor"], dtype=torch.float64)
+    x_lor = torch.tensor(d["x_lor"], dtype=torch.float64, device=device)
+    dx_lor = torch.tensor(d["dx_lor"], dtype=torch.float64, device=device)
     theta_matlab = d["Theta_lor"]
     xi_matlab = d["Xi_lor"]
     polyorder = int(d["polyorder_lor"].item())
@@ -196,7 +203,8 @@ def test_lorenz():
     n = 3
 
     lib = sindy_torch.PolynomialLibrary(n, polyorder)
-    theta_torch = lib(x_lor).numpy()
+    theta_tensor = lib(x_lor)
+    theta_torch = sindy_torch.as_numpy(theta_tensor)
     check("Theta shape", theta_torch.shape == theta_matlab.shape)
 
     if theta_torch.shape == theta_matlab.shape:
@@ -206,10 +214,11 @@ def test_lorenz():
         check("Theta values (relative)", rel_err < 1e-10, f"rel err={rel_err:.2e}")
 
     xi_torch = sindy_torch.stls(
-        torch.tensor(theta_torch, dtype=torch.float64),
+        theta_tensor,
         dx_lor,
         lam=lam,
-    ).numpy()
+    )
+    xi_torch = sindy_torch.as_numpy(xi_torch)
 
     sp_py = np.abs(xi_torch) > 1e-10
     sp_ml = np.abs(xi_matlab) > 1e-10
@@ -240,13 +249,15 @@ def test_lorenz():
                 )
 
 
-def main():
+def main(device_arg="auto"):
+    device = sindy_torch.get_device(device_arg)
+    print(f"Device: {device}")
     require_fixtures()
-    test_pool_data_2var()
-    test_pool_data_3var()
-    test_stls_synthetic()
-    test_linear2d()
-    test_lorenz()
+    test_pool_data_2var(device)
+    test_pool_data_3var(device)
+    test_stls_synthetic(device)
+    test_linear2d(device)
+    test_lorenz(device)
 
     print(f"\n{'=' * 50}")
     print(f"RESULTS: {PASS_COUNT} passed, {FAIL_COUNT} failed")
@@ -259,5 +270,8 @@ def main():
 
 
 if __name__ == "__main__":
-    success = main()
+    parser = argparse.ArgumentParser()
+    sindy_torch.add_device_arg(parser)
+    args = parser.parse_args()
+    success = main(args.device)
     sys.exit(0 if success else 1)
