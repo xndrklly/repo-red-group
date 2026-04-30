@@ -10,6 +10,10 @@
 !/PDE/
 !/PDE/**
 
+# Keep data files.
+!/data/
+!/data/**
+
 # Exclude resourced code (external dependencies).
 PDE/resourced_code/
 
