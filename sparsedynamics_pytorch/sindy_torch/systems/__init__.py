@@ -6,6 +6,9 @@ from .spring_lattice import (
     make_sinusoidal_node_force,
 )
 from .spring_grid import (
+    BlockAverageReduction,
+    apply_block_average_reduction,
+    build_block_average_reduction,
     SimulationResult,
     build_stiffness_matrix,
     build_locality_mask,
@@ -13,6 +16,7 @@ from .spring_grid import (
     newmark_beta_simulation,
     newmark_beta_simulation_torch,
     node_index,
+    project_block_average_operator,
     zero_force,
     zero_force_torch,
 )

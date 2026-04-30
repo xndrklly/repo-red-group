@@ -53,12 +53,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import sindy_torch
 from sindy_torch.systems import (
+    apply_block_average_reduction,
+    build_block_average_reduction,
     build_locality_mask,
     build_stiffness_matrix,
     get_free_dofs,
     newmark_beta_simulation,
     newmark_beta_simulation_torch,
     node_index,
+    project_block_average_operator,
     zero_force,
     zero_force_torch,
 )
@@ -79,6 +82,8 @@ FOCUS_MODEL_NAMES = (
     "SINDy Adam local (no L1)",
     "SINDy Adam dense (no L1)",
 )
+
+STLS_DENSE_LAMBDA_SWEEP = [0.05, 0.75, 1.00, 1.50, 4.00]
 
 MODEL_COLORS = {
     "true": "#2563eb",
@@ -288,6 +293,68 @@ def generate_dataset(
     }
 
 
+def build_block_average_rom_dataset(
+    data: dict,
+    *,
+    block_size: int,
+) -> dict:
+    """Augment a spring-grid dataset with block-averaged ROM arrays.
+
+    The fine-grid side length ``data["n"]`` must be an integer multiple of
+    ``block_size``. Reduction is performed over the current free-DOF ordering,
+    so support-touching blocks are averaged over the active fine DOFs in those
+    blocks rather than over clamped zeros.
+    """
+    reduction = build_block_average_reduction(
+        int(data["n"]),
+        block_size,
+        free_dofs=data["free"],
+    )
+    n_rom = reduction.coarse_grid_size
+    K_rom_raw = project_block_average_operator(data["K_free"], reduction)
+    C_rom_raw = project_block_average_operator(data["C_free"], reduction)
+    K_rom = 0.5 * (K_rom_raw + K_rom_raw.T)
+    C_rom = 0.5 * (C_rom_raw + C_rom_raw.T)
+    rom_fields = {
+        "block_size": int(block_size),
+        "n_rom": int(n_rom),
+        "N_rom": int(n_rom * n_rom),
+        "R_avg": reduction.restriction.copy(),
+        "P_block": reduction.prolongation.copy(),
+        "block_active_counts": reduction.active_counts.copy(),
+        "block_index_by_free_dof": reduction.block_index_by_free_dof.copy(),
+        "U_rom": apply_block_average_reduction(data["U"], reduction),
+        "V_rom": apply_block_average_reduction(data["V"], reduction),
+        "A_rom": apply_block_average_reduction(data["A"], reduction),
+        "F_rom": apply_block_average_reduction(data["F"], reduction),
+        "A_target_rom": apply_block_average_reduction(data["A_target"], reduction),
+        "K_rom_raw": K_rom_raw,
+        "K_rom": K_rom,
+        "C_rom_raw": C_rom_raw,
+        "C_rom": C_rom,
+        "locality_rom": build_locality_mask(n_rom, include_anti_diagonal=True),
+    }
+
+    reduced_trajectories = []
+    for traj in data["trajectories"]:
+        traj_rom = dict(traj)
+        traj_rom.update({
+            "U_rom": apply_block_average_reduction(traj["U_free"], reduction),
+            "V_rom": apply_block_average_reduction(traj["V_free"], reduction),
+            "A_rom": apply_block_average_reduction(traj["A_free"], reduction),
+            "F_rom": apply_block_average_reduction(traj["F_free"], reduction),
+            "A_target_rom": apply_block_average_reduction(traj["A_target"], reduction),
+        })
+        traj_rom["u0_rom"] = traj_rom["U_rom"][0].copy()
+        traj_rom["v0_rom"] = traj_rom["V_rom"][0].copy()
+        reduced_trajectories.append(traj_rom)
+
+    reduced = dict(data)
+    reduced.update(rom_fields)
+    reduced["trajectories"] = reduced_trajectories
+    return reduced
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -378,13 +445,30 @@ def build_regression_problem(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    state_key: str = "U",
+    target_key: str = "A_target",
+    stiffness_key: str = "K_free",
+    mask_key: str = "locality_free",
 ) -> dict:
-    U = torch.as_tensor(data["U"], device=device, dtype=dtype)
-    # Use the corrected target (a + C v - f) when damping/forcing are present;
-    # falls back to the raw acceleration in the legacy zero-C / zero-f case.
-    target_array = data.get("A_target", data["A"])
+    """Build a regression problem from a dataset dictionary.
+
+    Default keys reproduce the original fine-grid setup. Alternate keys allow
+    the same regression path to be reused for reduced-order variants such as
+    block-averaged ROM data.
+    """
+    U = torch.as_tensor(data[state_key], device=device, dtype=dtype)
+    if target_key in data:
+        target_array = data[target_key]
+    elif target_key == "A_target":
+        # Backwards-compatible fallback for older zero-force datasets.
+        target_array = data["A"]
+    else:
+        raise KeyError(f"Missing regression target key: {target_key!r}")
+
     A = torch.as_tensor(target_array, device=device, dtype=dtype)
-    K_true = torch.as_tensor(data["K_free"], device=device, dtype=dtype)
+    if stiffness_key not in data:
+        raise KeyError(f"Missing stiffness key: {stiffness_key!r}")
+    K_true = torch.as_tensor(data[stiffness_key], device=device, dtype=dtype)
 
     n_total = U.shape[0]
     n_train = int(0.8 * n_total)
@@ -398,7 +482,9 @@ def build_regression_problem(
     theta_test = U[test_idx]
     target_test = A[test_idx]
 
-    xi_mask_np = data["locality_free"]
+    if mask_key not in data:
+        raise KeyError(f"Missing locality mask key: {mask_key!r}")
+    xi_mask_np = data[mask_key]
     xi_mask = torch.as_tensor(xi_mask_np, device=device)
 
     return {
@@ -1255,20 +1341,78 @@ def train_gradient_method(
 def run_stls(
     theta_train, target_train, theta_test, target_test, K_true,
     lam, mask=None,
+    n_iter: int = 10,
+    history_specs: list[dict] | None = None,
+    free: np.ndarray | None = None,
+    n_total_dofs: int | None = None,
+    n_eig: int = 5,
+    return_history: bool = False,
 ):
+    xi_history = None
     if mask is None:
-        xi = sindy_torch.stls(theta_train, target_train, lam=lam)
+        stls_result = sindy_torch.stls(
+            theta_train,
+            target_train,
+            lam=lam,
+            n_iter=n_iter,
+            return_history=return_history,
+        )
     else:
         mask = mask.to(device=theta_train.device)
-        xi = sindy_torch.stls_masked(theta_train, target_train, mask, lam=lam)
+        stls_result = sindy_torch.stls_masked(
+            theta_train,
+            target_train,
+            mask,
+            lam=lam,
+            n_iter=n_iter,
+            return_history=return_history,
+        )
+    if return_history:
+        xi, xi_history = stls_result
+    else:
+        xi = stls_result
     K_pred = xi_to_K(xi)
-    return {
+    result = {
         "xi": xi,
         "train_mse": derivative_mse(theta_train, xi, target_train),
         "test_mse": derivative_mse(theta_test, xi, target_test),
         "K_err": relative_K_error(K_pred, K_true),
         "K_pred": K_pred,
     }
+    if return_history and xi_history is not None:
+        snap_epochs = np.arange(len(xi_history), dtype=float)
+        result["train_losses"] = np.asarray(
+            [derivative_mse(theta_train, xi_k, target_train) for xi_k in xi_history],
+            dtype=float,
+        )
+        result["test_losses"] = np.asarray(
+            [derivative_mse(theta_test, xi_k, target_test) for xi_k in xi_history],
+            dtype=float,
+        )
+        result["snap_epochs"] = snap_epochs
+        result["snap_evals"] = np.asarray(
+            [k_eigenvalues(xi_to_K(xi_k), n_eig) for xi_k in xi_history],
+            dtype=float,
+        )
+        result["snap_K_err"] = np.asarray(
+            [relative_K_error(xi_to_K(xi_k), K_true) for xi_k in xi_history],
+            dtype=float,
+        )
+        result["true_evals"] = k_eigenvalues(K_true, n_eig)
+        result["n_stls_iter"] = int(n_iter)
+        if history_specs and free is not None and n_total_dofs is not None:
+            param_history = {spec["series_key"]: [] for spec in history_specs}
+            for xi_k in xi_history:
+                K_pred_full = build_full_K_from_free(xi_to_K(xi_k), free, n_total_dofs)
+                for spec in history_specs:
+                    param_history[spec["series_key"]].append(
+                        float(-K_pred_full[spec["node"], spec["neighbor"]])
+                    )
+            result["parameter_history_epochs"] = snap_epochs.copy()
+            result["parameter_history"] = {
+                key: np.asarray(vals, dtype=float) for key, vals in param_history.items()
+            }
+    return result
 
 
 def summarize_method_metrics(stls_results: dict, grad_results: dict) -> dict[str, dict[str, float]]:
@@ -1337,22 +1481,37 @@ def benchmark_focus_rollouts(
 # Plotting helpers (current HTML diagnostics)
 # ---------------------------------------------------------------------------
 
-def plot_loss_curves(results: dict, output_stem: Path | None = None) -> str:
+def plot_loss_curves(
+    results: dict,
+    output_stem: Path | None = None,
+    *,
+    x_label: str = "Epoch",
+    title_prefix: str = "",
+) -> str:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
     for name, res in results.items():
-        axes[0].plot(res["train_losses"], label=name)
-        axes[1].plot(res["test_losses"], label=name)
+        x_train = np.arange(len(res["train_losses"]))
+        x_test = np.arange(len(res["test_losses"]))
+        axes[0].plot(x_train, res["train_losses"], label=name)
+        axes[1].plot(x_test, res["test_losses"], label=name)
     for ax, title in zip(axes, ("Train MSE", "Test MSE")):
         ax.set_yscale("log")
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel(x_label)
         ax.set_ylabel("MSE")
-        ax.set_title(title)
+        ax.set_title(f"{title_prefix}{title}" if title_prefix else title)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
     return maybe_save_for_html(fig, output_stem=output_stem, return_base64=True)
 
 
-def plot_eigenvalues(name: str, res: dict, output_stem: Path | None = None) -> str:
+def plot_eigenvalues(
+    name: str,
+    res: dict,
+    output_stem: Path | None = None,
+    *,
+    x_label: str = "Epoch",
+    title_x_name: str = "epoch",
+) -> str:
     snap_epochs = res["snap_epochs"]
     snap_evals = res["snap_evals"]  # (n_snap, n_eig)
     true_evals = res["true_evals"]
@@ -1366,22 +1525,28 @@ def plot_eigenvalues(name: str, res: dict, output_stem: Path | None = None) -> s
                 color=color, label=f"eig {i + 1} (pred)")
         ax.axhline(true_evals[i], color=color, linestyle="--", alpha=0.7,
                    label=f"eig {i + 1} (true)")
-    ax.set_xlabel("Epoch")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("Eigenvalue of K")
-    ax.set_title(f"{name}: lowest {n_eig} eigenvalues vs epoch")
+    ax.set_title(f"{name}: lowest {n_eig} eigenvalues vs {title_x_name}")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=7, ncol=2)
     return maybe_save_for_html(fig, output_stem=output_stem, return_base64=True)
 
 
-def plot_K_error(grad_results: dict, output_stem: Path | None = None) -> str:
+def plot_K_error(
+    grad_results: dict,
+    output_stem: Path | None = None,
+    *,
+    x_label: str = "Epoch",
+    title_x_name: str = "epoch",
+) -> str:
     fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
     for name, res in grad_results.items():
         ax.plot(res["snap_epochs"], res["snap_K_err"], label=name)
     ax.set_yscale("log")
-    ax.set_xlabel("Epoch")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("|K_pred - K_true| / |K_true|")
-    ax.set_title("Relative K error vs epoch")
+    ax.set_title(f"Relative K error vs {title_x_name}")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     return maybe_save_for_html(fig, output_stem=output_stem, return_base64=True)
@@ -1409,6 +1574,91 @@ def plot_K_matrices(K_true: torch.Tensor, K_preds: dict, output_stem: Path | Non
         plt.colorbar(im, ax=ax, shrink=0.8)
 
     return maybe_save_for_html(fig, output_stem=output_stem, return_base64=True)
+
+
+def plot_stls_lambda_sweep(
+    K_true: torch.Tensor,
+    theta_train: torch.Tensor,
+    target_train: torch.Tensor,
+    *,
+    lam_values: list[float],
+    theta_test: torch.Tensor | None = None,
+    target_test: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    output_stem: Path | None = None,
+    return_base64: bool = True,
+) -> str | None:
+    """Visualise how the dense STLS threshold changes the recovered K matrix."""
+    ordered_lams = list(OrderedDict.fromkeys(float(lam) for lam in lam_values))
+    if not ordered_lams:
+        raise ValueError("lam_values must contain at least one threshold")
+
+    theta_eval = theta_test if theta_test is not None else theta_train
+    target_eval = target_test if target_test is not None else target_train
+
+    sweep_results = OrderedDict()
+    matrices = [K_true.detach().cpu().numpy()]
+    for lam in ordered_lams:
+        result = run_stls(
+            theta_train,
+            target_train,
+            theta_eval,
+            target_eval,
+            K_true,
+            lam=lam,
+            mask=mask,
+        )
+        sweep_results[lam] = result
+        matrices.append(result["K_pred"].detach().cpu().numpy())
+
+    n_panels = 1 + len(sweep_results)
+    n_cols = min(3, n_panels)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.8 * n_cols, 3.8 * n_rows),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes).ravel()
+    vmax = max(float(np.abs(matrix).max()) for matrix in matrices)
+    vmax = max(vmax, 1e-10)
+
+    im = axes[0].imshow(matrices[0], cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    true_nnz = int(np.count_nonzero(np.abs(matrices[0]) > 1e-10))
+    axes[0].set_title(f"True K\nnnz={true_nnz}", fontsize=10)
+
+    for ax, (lam, result) in zip(axes[1:], sweep_results.items()):
+        matrix = result["K_pred"].detach().cpu().numpy()
+        nnz = int(np.count_nonzero(np.abs(matrix) > 1e-10))
+        ax.imshow(matrix, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        ax.set_title(
+            f"Dense STLS ($\\lambda$={lam:g})\n"
+            f"nnz={nnz}, rel err={result['K_err']:.2e}",
+            fontsize=10,
+        )
+
+    for idx, ax in enumerate(axes[:n_panels]):
+        row_idx = idx // n_cols
+        col_idx = idx % n_cols
+        if row_idx == n_rows - 1:
+            ax.set_xlabel("Column")
+        else:
+            ax.set_xlabel("")
+        if col_idx == 0:
+            ax.set_ylabel("Row")
+        else:
+            ax.set_ylabel("")
+
+    for ax in axes[n_panels:]:
+        ax.axis("off")
+
+    fig.suptitle(
+        "Dense STLS threshold sweep for recovered stiffness matrix",
+        fontsize=12,
+    )
+    fig.colorbar(im, ax=list(axes[:n_panels]), shrink=0.86, label="K coefficient")
+    return maybe_save_for_html(fig, output_stem=output_stem, return_base64=return_base64)
 
 
 # ---------------------------------------------------------------------------
@@ -1943,6 +2193,17 @@ def run_workflow(
             K_true_plot,
             K_preds,
             output_stem=output_dirs["figure_dir"] / "current_recovered_k_matrices",
+        )
+        plot_stls_lambda_sweep(
+            K_true_plot,
+            stls_problem["theta_train"],
+            stls_problem["target_train"],
+            theta_test=stls_problem["theta_test"],
+            target_test=stls_problem["target_test"],
+            lam_values=STLS_DENSE_LAMBDA_SWEEP,
+            mask=None,
+            output_stem=output_dirs["figure_dir"] / "stls_dense_lambda_sweep_k_matrices",
+            return_base64=False,
         )
 
         eig_blocks = []

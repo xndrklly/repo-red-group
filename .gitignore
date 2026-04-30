@@ -30,6 +30,9 @@ PDE/resourced_code/
 !/figures/spring_grid_10x10_physical_three_model_report.html
 !/figures/spring_grid_10x10_random_three_model_report.html
 !/figures/spring_grid_10x10_physical_forced_two_model_report.html
+!/figures/spring_grid_10x10_physical_forced_adam_dense_l1_1e_3_report.html
+!/figures/spring_grid_10x10_physical_forced_rom_vs_full_report.html
+!/figures/spring_grid_10x10_physical_forced_rom_vs_full_stls_report.html
 
 !/results/
 /results/*
@@ -41,6 +44,12 @@ PDE/resourced_code/
 !/results/figures/spring_grid_10x10_random_three_model/**
 !/results/figures/spring_grid_10x10_physical_forced_two_model/
 !/results/figures/spring_grid_10x10_physical_forced_two_model/**
+!/results/figures/spring_grid_10x10_physical_forced_adam_dense_l1_1e_3/
+!/results/figures/spring_grid_10x10_physical_forced_adam_dense_l1_1e_3/**
+!/results/figures/spring_grid_10x10_physical_forced_rom_vs_full/
+!/results/figures/spring_grid_10x10_physical_forced_rom_vs_full/**
+!/results/figures/spring_grid_10x10_physical_forced_rom_vs_full_stls/
+!/results/figures/spring_grid_10x10_physical_forced_rom_vs_full_stls/**
 !/results/animations/
 /results/animations/*
 !/results/animations/spring_grid_10x10_physical_three_model/
@@ -49,6 +58,12 @@ PDE/resourced_code/
 !/results/animations/spring_grid_10x10_random_three_model/**
 !/results/animations/spring_grid_10x10_physical_forced_two_model/
 !/results/animations/spring_grid_10x10_physical_forced_two_model/**
+!/results/animations/spring_grid_10x10_physical_forced_adam_dense_l1_1e_3/
+!/results/animations/spring_grid_10x10_physical_forced_adam_dense_l1_1e_3/**
+!/results/animations/spring_grid_10x10_physical_forced_rom_vs_full/
+!/results/animations/spring_grid_10x10_physical_forced_rom_vs_full/**
+!/results/animations/spring_grid_10x10_physical_forced_rom_vs_full_stls/
+!/results/animations/spring_grid_10x10_physical_forced_rom_vs_full_stls/**
 
 # Exclude generated example outputs and local Python packaging/tool artifacts.
 sparsedynamics_pytorch/figures/

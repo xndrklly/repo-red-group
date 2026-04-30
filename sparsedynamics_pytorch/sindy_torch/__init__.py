@@ -28,8 +28,16 @@ from .models import SINDyModule, NeuralODEModule, ODEModel
 # Differentiation
 from .differentiation import finite_difference_4th, autograd_derivative, tv_reg_diff
 
-# Reference dynamical systems
-from .systems import lorenz, hopf, logistic
+# Reference dynamical systems and structured spring-grid helpers
+from .systems import (
+    BlockAverageReduction,
+    apply_block_average_reduction,
+    build_block_average_reduction,
+    hopf,
+    logistic,
+    lorenz,
+    project_block_average_operator,
+)
 
 # Trajectory helpers
 from .trajectory import (
