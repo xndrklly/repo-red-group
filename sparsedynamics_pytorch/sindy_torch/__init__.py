@@ -20,7 +20,7 @@ from .library import (
 )
 
 # Solvers
-from .solvers import stls, SparseOptimizer, GradientOptimizer
+from .solvers import stls, stls_masked, SparseOptimizer, GradientOptimizer
 
 # Models
 from .models import SINDyModule, NeuralODEModule, ODEModel
@@ -30,6 +30,15 @@ from .differentiation import finite_difference_4th, autograd_derivative, tv_reg_
 
 # Reference dynamical systems
 from .systems import lorenz, hopf, logistic
+
+# Trajectory helpers
+from .trajectory import (
+    TrajectoryWindow,
+    compute_state_scales,
+    make_overlapping_trajectory_windows,
+    normalized_state_mse,
+    stack_state_trajectory,
+)
 
 # Utilities
 from .utils import add_device_arg, as_numpy, get_device, to_tensor
