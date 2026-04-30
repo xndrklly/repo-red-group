@@ -57,3 +57,53 @@ def stls(
                 xi[big_inds, col] = xi_col.squeeze(-1)
 
     return xi.detach()
+
+
+def stls_masked(
+    theta: Tensor,
+    dxdt: Tensor,
+    mask: Tensor,
+    lam: float = 0.0,
+    n_iter: int = 10,
+) -> Tensor:
+    """STLS with a hard support mask (locality / structural prior).
+
+    The recovered Xi is constrained to be zero everywhere `mask` is False;
+    only the True entries are estimated by least squares, with optional
+    sequential thresholding at level `lam`.
+
+    Parameters
+    ----------
+    theta : Tensor, shape (n_samples, n_features)
+    dxdt : Tensor, shape (n_samples, n_states)
+    mask : Tensor (bool), shape (n_features, n_states)
+        Allowed support pattern. Per-column least-squares fits use only the
+        rows where `mask[:, col]` is True.
+    lam : float
+        Sparsification threshold (set to 0 to keep every allowed entry).
+    n_iter : int
+        Refit iterations.
+    """
+    n_features, n_states = mask.shape
+    xi = torch.zeros(n_features, n_states, dtype=theta.dtype, device=theta.device)
+
+    for col in range(n_states):
+        support = mask[:, col]
+        if support.any():
+            sol = torch.linalg.lstsq(
+                theta[:, support], dxdt[:, col : col + 1]
+            ).solution
+            xi[support, col] = sol.squeeze(-1)
+
+    for _ in range(n_iter):
+        keep = (xi.abs() >= lam) & mask
+        xi = torch.zeros_like(xi)
+        for col in range(n_states):
+            support = keep[:, col]
+            if support.any():
+                sol = torch.linalg.lstsq(
+                    theta[:, support], dxdt[:, col : col + 1]
+                ).solution
+                xi[support, col] = sol.squeeze(-1)
+
+    return xi.detach()

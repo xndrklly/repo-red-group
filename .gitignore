@@ -17,8 +17,40 @@ PDE/resourced_code/
 **/__pycache__/
 *.py[cod]
 
+# Re-include /figures and /results at the directory level so a few
+# generated reports and their asset directories can be selectively
+# whitelisted below; the default for everything else under these dirs
+# remains "ignored".
+!/figures/
+/figures/*
+!/figures/spring_grid_10x10_physical_three_model_report.html
+!/figures/spring_grid_10x10_random_three_model_report.html
+!/figures/spring_grid_10x10_physical_forced_two_model_report.html
+
+!/results/
+/results/*
+!/results/figures/
+/results/figures/*
+!/results/figures/spring_grid_10x10_physical_three_model/
+!/results/figures/spring_grid_10x10_physical_three_model/**
+!/results/figures/spring_grid_10x10_random_three_model/
+!/results/figures/spring_grid_10x10_random_three_model/**
+!/results/figures/spring_grid_10x10_physical_forced_two_model/
+!/results/figures/spring_grid_10x10_physical_forced_two_model/**
+!/results/animations/
+/results/animations/*
+!/results/animations/spring_grid_10x10_physical_three_model/
+!/results/animations/spring_grid_10x10_physical_three_model/**
+!/results/animations/spring_grid_10x10_random_three_model/
+!/results/animations/spring_grid_10x10_random_three_model/**
+!/results/animations/spring_grid_10x10_physical_forced_two_model/
+!/results/animations/spring_grid_10x10_physical_forced_two_model/**
+
 # Exclude generated example outputs and local Python packaging/tool artifacts.
 sparsedynamics_pytorch/figures/
+sparsedynamics_pytorch/results/
+sparsedynamics_pytorch/animations/
+sparsedynamics_pytorch/examples/benchmark_*.py
 sparsedynamics_pytorch/.venv/
 sparsedynamics_pytorch/venv/
 sparsedynamics_pytorch/env/
