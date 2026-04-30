@@ -55,9 +55,9 @@ def make_test_functions(X, K=50, lx=None, ly=None, seed=0):
     L = max(xmax - xmin, ymax - ymin)
 
     if lx is None:
-        lx = L / 4.0
+        lx = L / 8.0
     if ly is None:
-        ly = L / 4.0
+        ly = L / 8.0
 
     test_fns = []
     for _ in range(K):

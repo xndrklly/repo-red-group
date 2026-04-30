@@ -170,13 +170,33 @@ def pde_loss(model, eps, grad_psis, DX):
     -------
     loss : scalar torch tensor
     """
+    device = next(model.parameters()).device
     if not isinstance(eps, torch.Tensor):
-        eps = torch.tensor(eps, dtype=torch.float32)
+        eps = torch.tensor(eps, dtype=torch.float32, device=device)
+    else:
+        eps = eps.to(device)
 
-    loss = torch.tensor(0.0, requires_grad=False)
+    loss = torch.tensor(0.0, device=device, requires_grad=False)
     for gp in grad_psis:
-        gp_t = torch.tensor(gp, dtype=torch.float32)
+        gp_t = torch.tensor(gp, dtype=torch.float32, device=device)
         R = weak_residual(model, eps, gp_t, DX)
         loss = loss + (R**2).sum()
 
     return loss
+
+
+def boundary_reaction_loss(model, bdry_eps_t, F_target, DX):
+    """
+    Match predicted total vertical traction on a horizontal boundary row
+    to a measured reaction force target.
+    """
+    e11 = bdry_eps_t[:, 0]
+    e22 = bdry_eps_t[:, 1]
+    e12 = bdry_eps_t[:, 2]
+    I1 = e11 + e22
+    I2 = e11**2 + 2.0 * e12**2 + e22**2
+    inv_t = torch.stack([I1, I2], dim=-1)
+
+    sigma = model(inv_t)              # (M, 3) with sigma[:,1] = s22
+    F_pred = sigma[:, 1].sum() * DX   # integral along boundary row
+    return (F_pred - F_target) ** 2

@@ -107,15 +107,21 @@ class ICNN(nn.Module):
 
             W = self._forward_W(z0)
 
-            # Thermodynamic correction: W_c = W(z0) - W(0) - ∇W(0)·z0
-            # Enforces W(0)=0 AND ∇W(0)=0 → zero stress at zero strain.
+            # Thermodynamic correction: W_c = W(z0) - W(0) - (∂W/∂I1)|₀ · I1
+            #
+            # Only the I1 term is subtracted, not the I2 term. Reason:
+            #   s11 = ∂W/∂I1 + 2ε11·∂W/∂I2  → zero at ε=0 requires ∂W/∂I1|₀=0
+            #   s12 = 2ε12·∂W/∂I2            → zero at ε=0 because ε12=0, NOT
+            #                                    because ∂W/∂I2|₀=0
+            # Subtracting the I2 linear term (as the full ∇W·z0 correction does)
+            # forces ∂W/∂I2|₀=0, which kills the linear shear modulus.
             z0_ref = torch.zeros(1, 2, device=z0.device, dtype=z0.dtype,
                                  requires_grad=True)
             W_ref = self._forward_W(z0_ref)
             grad_ref = torch.autograd.grad(
                 W_ref.sum(), z0_ref, create_graph=self.training
             )[0]
-            W = W - W_ref - (z0 * grad_ref).sum(dim=-1, keepdim=True)
+            W = W - W_ref - z0[:, 0:1] * grad_ref[:, 0:1]
 
             grads = torch.autograd.grad(
                 W.sum(), z0, create_graph=self.training

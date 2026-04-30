@@ -4,10 +4,10 @@ run.py
 Full pipeline: load spring-lattice data → smooth → train constitutive NN
 → save diagnostic plots.
 
-Usage (run from the PDE directory):
-    python simple_data_gen.py            # once, creates data/lattice_duffing.npz
-    python run.py                        # uses data/lattice_duffing.npz by default
-    python run.py --data data/lattice_linear.npz
+Usage (run from PDE/MLP/):
+    python simple_data_gen.py            # once, creates ../data/lattice_duffing.npz
+    python run.py                        # uses ../data/lattice_duffing.npz by default
+    python run.py --data ../data/lattice_linear.npz
 
 Outputs in results/<data-stem>/:
     smoothed_vs_original.png  -- raw vs smoothed displacement field
@@ -30,11 +30,13 @@ from smoothing import GaussianSmoother, make_eval_grid
 from train import train as train_model
 
 
+
 # ------------------------------------------------------------------ helpers --
 
 def load_data(path):
     d = np.load(path)
-    return d['node_pos'], d['u'], float(d['DX'])
+    F_reaction_y = float(d['F_reaction_y']) if 'F_reaction_y' in d else None
+    return d['node_pos'], d['u'], float(d['DX']), F_reaction_y
 
 
 def smooth(node_pos, u, DX, margin=3):
@@ -223,8 +225,8 @@ def plot_pde_residual(model, eps_static, eval_grid, out):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default='data/lattice_duffing.npz',
-                        help='Path to lattice .npz file (default: data/lattice_duffing.npz)')
+    parser.add_argument('--data', default='../data/lattice_duffing.npz',
+                        help='Path to lattice .npz file')
     args = parser.parse_args()
 
     data_stem   = os.path.splitext(os.path.basename(args.data))[0]
@@ -236,7 +238,7 @@ def main():
 
     # 1. Load
     print(f'Loading {args.data} ...')
-    node_pos, u, DX = load_data(args.data)
+    node_pos, u, DX, F_reaction_y = load_data(args.data)
 
     # 2. Smooth
     print('Smoothing displacement field ...')
@@ -246,9 +248,14 @@ def main():
     np.savez(out('smoothed_data.npz'), eval_grid=eval_grid, u_hat=u_hat, eps=eps)
     print(f'Saved  {out("smoothed_data.npz")}')
 
+    bdry_eps = eps_static[-1, :, :] if F_reaction_y is not None else None
+
     # 3. Train
-    model, losses = train_model(eps_static, eval_grid, DX=DX,
-                                K=50, epochs=2000, lr=1e-3)
+    model, losses = train_model(
+        eps_static, eval_grid, DX=DX,
+        K=50, epochs=2000, lr=1e-3,
+        reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor=1.0
+    )
 
     # 4. Plots
     plot_smoothed_vs_original(node_pos, u, eval_grid, u_hat, eps,

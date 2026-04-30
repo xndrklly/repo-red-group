@@ -14,6 +14,7 @@ Outputs in results/<data-stem>/:
     loss_curve.png            -- training loss (log scale)
     stress_strain.png         -- ICNN σ-ε curves (sweep each strain component)
     pde_residual.png          -- pointwise |∇·σ| residual colormap
+    vertical_resultant.png    -- ∫σ_yy dx vs height vs target reaction (if available)
     smoothed_data.npz         -- smoothed displacement and strain arrays
 """
 
@@ -109,17 +110,35 @@ def plot_smoothed_vs_original(node_pos, u_raw, eval_grid, u_hat, eps, out):
     print(f'Saved  {out}')
 
 
-def plot_loss(losses, out):
+def plot_loss(losses, K, out):
+    losses = np.asarray(losses)
+    loss_per_k = losses / max(K, 1)
+
+    # Convergence check: compare mean of last 10% vs first 10% of tail
+    tail = max(len(losses) // 10, 1)
+    final_mean  = loss_per_k[-tail:].mean()
+    earlier_mean = loss_per_k[-2*tail:-tail].mean() if len(losses) >= 2 * tail else loss_per_k[0]
+    still_dropping = final_mean < 0.9 * earlier_mean
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.semilogy(losses)
+    ax.semilogy(loss_per_k, lw=1.2)
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('PDE loss  (log scale)')
-    ax.set_title('Training loss  (ICNN)')
+    ax.set_ylabel('loss / K  (log scale)')
+    ax.set_title('Training loss / K  (ICNN)')
     ax.grid(True, which='both', alpha=0.4)
+
+    status = 'still dropping — consider more epochs' if still_dropping else 'converged / plateau'
+    ax.annotate(
+        f'final loss/K = {final_mean:.2e}\n{status}',
+        xy=(0.98, 0.95), xycoords='axes fraction',
+        ha='right', va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.7),
+    )
+
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f'Saved  {out}')
+    print(f'Saved  {out}  (final loss/K = {final_mean:.2e}, {status})')
 
 
 def plot_stress_strain(model, eps_static, out):
@@ -232,6 +251,76 @@ def plot_pde_residual(model, eps_static, eval_grid, out):
     print(f'Saved  {out}')
 
 
+def plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y, out):
+    """
+    Vertical Cauchy resultant along each horizontal row:
+
+        R_y(y_i) ≈ sum_j sigma_yy(i, j) * dx
+
+    Same construction as boundary_reaction_loss on one row. If the dataset
+    provides F_reaction_y (spring bottom reaction), overlay it as the target
+    scalar used in training (matched on the *top* eval row in train.py).
+
+    Interpreting: pointwise div sigma does not show force balance directly;
+    comparing this resultant to a measured reaction is a global vertical
+    scale check. R_y(y) need not be constant in y on a finite domain with shear.
+    """
+    M = eval_grid.shape[0]
+    dx = float(eval_grid[0, 1, 0] - eval_grid[0, 0, 0])
+
+    model.eval()
+    eps_f = eps_static.reshape(-1, 3)
+    with torch.no_grad():
+        sigma_f = model(torch.tensor(eps_f, dtype=torch.float32)).numpy()
+    sigma = sigma_f.reshape(M, M, 3)
+    s22 = sigma[:, :, 1]
+    Ry = s22.sum(axis=1) * dx
+    y_row = eval_grid[:, 0, 1]
+
+    # Flatness metric: coefficient of variation (std/|mean|) of interior rows.
+    # A perfectly flat resultant has CV = 0; < 0.05 is good.
+    interior = Ry[1:-1]
+    cv = float(np.std(interior) / max(abs(np.mean(interior)), 1e-12))
+    flatness_note = f'CV = {cv:.3f}  ({"good" if cv < 0.05 else "not flat yet"})'
+
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    ax.plot(Ry, y_row, 'b.-', lw=1.5, markersize=4, label=r'$\int \sigma_{yy}\,dx$ (ICNN)')
+    if F_reaction_y is not None:
+        ax.axvline(
+            float(F_reaction_y),
+            color='r',
+            ls='--',
+            lw=2,
+            label=f'target $F_y$ (data) = {float(F_reaction_y):.4g}',
+        )
+    ax.set_xlabel(r'vertical resultant $\int \sigma_{yy}\,dx$')
+    ax.set_ylabel('y')
+    ax.set_title('Vertical stress resultant vs height')
+    ax.annotate(
+        flatness_note,
+        xy=(0.98, 0.05), xycoords='axes fraction',
+        ha='right', va='bottom', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='lightblue', alpha=0.7),
+    )
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved  {out}  ({flatness_note})')
+
+    print(
+        f'  Resultant ICNN:  top row (max y) R_y = {float(Ry[-1]):.6g}  '
+        f'bottom row R_y = {float(Ry[0]):.6g}'
+    )
+    if F_reaction_y is not None:
+        err_top = float(Ry[-1]) - float(F_reaction_y)
+        print(
+            f'  vs data F_reaction_y = {float(F_reaction_y):.6g}  '
+            f'(top-row delta = {err_top:+.6g}; training matches this scalar)'
+        )
+
+
 # -------------------------------------------------------------------  main  --
 
 def main():
@@ -304,6 +393,8 @@ def main():
     auto_load = os.path.exists(model_path) and not args.force_train
     use_load = args.load_model or auto_load
 
+    K = 50  # number of test functions — used by training and loss plot
+
     if use_load:
         if args.load_model and not os.path.exists(model_path):
             raise FileNotFoundError(f'--load-model was set but model file does not exist: {model_path}')
@@ -324,13 +415,14 @@ def main():
         dropout = 0.2
         model, losses = train_model(
             eps_static, eval_grid, DX=DX,
-            K=50, epochs=2000,
+            K=K, epochs=2000,
             hidden=hidden, layers=layers,
             act_scale=act_scale, dropout=dropout,
-            optimizer='adam',
-            base_lr=1e-3, max_lr=1e-1,
-            lr_schedule='cyclic', cycle_steps=100,
-            reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor=1.0,
+            optimizer='lbfgs',
+            base_lr=1.0,
+            lr_schedule='constant',
+            reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor='auto',
+            checkpoint_path=model_path, checkpoint_every=200,
             seed=0
         )
         torch.save(
@@ -350,11 +442,15 @@ def main():
     plot_smoothed_vs_original(node_pos, u, eval_grid, u_hat, eps,
                               out('smoothed_vs_original.png'))
     if len(losses) > 0:
-        plot_loss(losses,     out('loss_curve.png'))
+        plot_loss(losses, K,  out('loss_curve.png'))
     plot_stress_strain(model, eps_static,
                               out('stress_strain.png'))
     plot_pde_residual(model,  eps_static, eval_grid,
                               out('pde_residual.png'))
+    plot_vertical_resultant(
+        model, eps_static, eval_grid, F_reaction_y,
+        out('vertical_resultant.png'),
+    )
 
     print(f'\nAll done.  Results in {results_dir}/')
 

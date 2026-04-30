@@ -156,6 +156,18 @@ def solve_nonlinear(ax, ay, bx, by, lx, ly, k1, k3, n_dof, prescribed,
     return u
 
 
+def compute_reaction_force_y(u, ax, ay, bx, by, lx, ly, k1, k3, bottom_y_dofs):
+    """Compute total vertical support reaction on bottom boundary."""
+    d_ext = lx * (u[bx] - u[ax]) + ly * (u[by] - u[ay])
+    F = k1 * d_ext + k3 * d_ext**3
+
+    f_int = np.zeros_like(u)
+    np.add.at(f_int, ax, -F * lx);  np.add.at(f_int, ay, -F * ly)
+    np.add.at(f_int, bx,  F * lx);  np.add.at(f_int, by,  F * ly)
+
+    return float((-f_int[bottom_y_dofs]).sum())
+
+
 # ----------------------------------------------------------------- main plot --
 
 def save_displacement_plot(ux, uy, delta, fname):
@@ -211,9 +223,16 @@ def main():
 
     # Boundary conditions: fix bottom row, pull top row up by delta
     prescribed = {}
+    bottom_y_dofs = []
     for j in range(N):
-        nb_idx = 0 * N + j;  prescribed[2*nb_idx]   = 0.0;  prescribed[2*nb_idx+1]   = 0.0
-        nt_idx = (N-1)*N + j; prescribed[2*nt_idx]   = 0.0;  prescribed[2*nt_idx+1]   = delta
+        nb_idx = 0 * N + j
+        prescribed[2 * nb_idx] = 0.0
+        prescribed[2 * nb_idx + 1] = 0.0
+        bottom_y_dofs.append(2 * nb_idx + 1)
+
+        nt_idx = (N - 1) * N + j
+        prescribed[2 * nt_idx] = 0.0
+        prescribed[2 * nt_idx + 1] = delta
 
     print(f'Building {mode} springs ...')
     ax, ay, bx, by, lx, ly, k1, k3 = build_springs(N, a, rng, mode)
@@ -227,15 +246,19 @@ def main():
     ux = u_full[0::2].reshape(N, N)
     uy = u_full[1::2].reshape(N, N)
     u  = np.stack([ux, uy], axis=-1)[:, :, np.newaxis, :]   # (N, N, 1, 2)
+    F_reaction_y = compute_reaction_force_y(
+        u_full, ax, ay, bx, by, lx, ly, k1, k3, np.array(bottom_y_dofs, dtype=int)
+    )
 
-    os.makedirs('data', exist_ok=True)
-    out_npz  = f'data/lattice_{mode}.npz'
-    out_plot = f'data/displacement_{mode}.png'
+    os.makedirs('../data', exist_ok=True)
+    out_npz  = f'../data/lattice_{mode}.npz'
+    out_plot = f'../data/displacement_{mode}.png'
 
-    np.savez(out_npz, node_pos=node_pos, u=u, DX=a)
+    np.savez(out_npz, node_pos=node_pos, u=u, DX=a, F_reaction_y=F_reaction_y)
     print(f'Saved  {out_npz}')
     print(f'  node_pos : {node_pos.shape}')
     print(f'  u        : {u.shape}   max|u| = {np.abs(u).max():.4f}')
+    print(f'  F_reaction_y (bottom total) : {F_reaction_y:.6e}')
 
     save_displacement_plot(ux, uy, delta, out_plot)
 

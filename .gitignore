@@ -6,6 +6,13 @@
 !/sparsedynamics_pytorch/
 !/sparsedynamics_pytorch/**
 
+# Keep PDE constitutive learning code.
+!/PDE/
+!/PDE/**
+
+# Exclude resourced code (external dependencies).
+PDE/resourced_code/
+
 # Exclude generated Python artifacts.
 **/__pycache__/
 *.py[cod]
