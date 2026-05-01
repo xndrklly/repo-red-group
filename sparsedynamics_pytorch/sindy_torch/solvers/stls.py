@@ -15,7 +15,8 @@ def stls(
     dxdt: Tensor,
     lam: float,
     n_iter: int = 10,
-) -> Tensor:
+    return_history: bool = False,
+) -> Tensor | tuple[Tensor, list[Tensor]]:
     """Find sparse coefficient matrix Xi such that dxdt ≈ Theta @ Xi.
 
     Uses sequential thresholded least squares: solve least-squares,
@@ -33,6 +34,11 @@ def stls(
     n_iter : int
         Number of thresholding iterations (default 10).
 
+    return_history : bool
+        When True, also return a list of Xi snapshots. Entry 0 is the initial
+        least-squares solve before thresholding; entries 1..n_iter are the
+        sequential threshold/refit iterates.
+
     Returns
     -------
     xi : Tensor, shape (n_features, n_states)
@@ -40,6 +46,7 @@ def stls(
     """
     # Initial least-squares solution
     xi = torch.linalg.lstsq(theta, dxdt).solution
+    history = [xi.detach().clone()] if return_history else None
 
     n_states = dxdt.shape[1]
 
@@ -56,7 +63,13 @@ def stls(
                 ).solution
                 xi[big_inds, col] = xi_col.squeeze(-1)
 
-    return xi.detach()
+        if return_history:
+            history.append(xi.detach().clone())
+
+    xi_out = xi.detach()
+    if return_history:
+        return xi_out, history
+    return xi_out
 
 
 def stls_masked(
@@ -65,7 +78,8 @@ def stls_masked(
     mask: Tensor,
     lam: float = 0.0,
     n_iter: int = 10,
-) -> Tensor:
+    return_history: bool = False,
+) -> Tensor | tuple[Tensor, list[Tensor]]:
     """STLS with a hard support mask (locality / structural prior).
 
     The recovered Xi is constrained to be zero everywhere `mask` is False;
@@ -83,6 +97,10 @@ def stls_masked(
         Sparsification threshold (set to 0 to keep every allowed entry).
     n_iter : int
         Refit iterations.
+    return_history : bool
+        When True, also return a list of Xi snapshots. Entry 0 is the initial
+        masked least-squares solve before thresholding; entries 1..n_iter are
+        the sequential threshold/refit iterates.
     """
     n_features, n_states = mask.shape
     xi = torch.zeros(n_features, n_states, dtype=theta.dtype, device=theta.device)
@@ -94,6 +112,7 @@ def stls_masked(
                 theta[:, support], dxdt[:, col : col + 1]
             ).solution
             xi[support, col] = sol.squeeze(-1)
+    history = [xi.detach().clone()] if return_history else None
 
     for _ in range(n_iter):
         keep = (xi.abs() >= lam) & mask
@@ -105,5 +124,10 @@ def stls_masked(
                     theta[:, support], dxdt[:, col : col + 1]
                 ).solution
                 xi[support, col] = sol.squeeze(-1)
+        if return_history:
+            history.append(xi.detach().clone())
 
-    return xi.detach()
+    xi_out = xi.detach()
+    if return_history:
+        return xi_out, history
+    return xi_out
