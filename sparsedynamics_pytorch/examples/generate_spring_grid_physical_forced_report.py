@@ -15,7 +15,7 @@ Setup:
 
 Methods (only two, by request):
   * STLS dense (lam=0.05)
-  * SINDy Adam local (no L1)
+  * SINDy Adam local (configurable L1; default no L1)
 
 The report skips trajectory-based regression methods and trajectory rollout
 diagnostics (figures 2A/2B/2C/2D and time traces); it keeps the lattice
@@ -44,7 +44,12 @@ from sindy_torch.systems.spring_grid import node_index
 
 
 STLS_NAME = "STLS dense (lam=0.05)"
-ADAM_RESIDUAL_NAME = "SINDy Adam local (no L1)"
+
+
+def format_adam_residual_name(l1_lambda: float) -> str:
+    if float(l1_lambda) == 0.0:
+        return "SINDy Adam local (no L1)"
+    return f"SINDy Adam local (L1={l1_lambda:.0e})"
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -132,7 +137,8 @@ the LHS yields <code>(u_tt + C u_t - f) = -K u</code>. We pass
 <code>target = a + C v - f</code> as the regression target so that the
 recovered Xi satisfies <code>K = -Xi^T</code> directly. STLS dense uses
 sequential thresholded least squares with no locality mask. SINDy Adam local
-zeros gradients on entries outside the 8-connected neighbour stencil.</p>
+zeros gradients on entries outside the 8-connected neighbour stencil and can
+optionally include an explicit L1 penalty on Xi.</p>
 </body>
 </html>
 """
@@ -331,7 +337,7 @@ def build_diagnostic_blocks(
         "</div>",
     ]
 
-    method_names = [STLS_NAME, ADAM_RESIDUAL_NAME]
+    method_names = [*stls_results.keys(), *grad_results.keys()]
     for model_name in method_names:
         if model_name in stls_results:
             K_pred_free = stls_results[model_name]["K_pred"].detach().cpu().numpy()
@@ -506,6 +512,7 @@ def main(
     residual_epochs: int = 1500,
     alpha: float = 0.05,
     beta: float = 0.02,
+    adam_l1_lambda: float = 0.0,
     force_amplitude: float = 1.0,
     force_omega: float = 2.0 * np.pi,
     force_sigma_cols: float = 1.5,
@@ -527,6 +534,7 @@ def main(
     print("\n=== Spring-Grid Physical Forced Report (CPU) ===")
     print(f"  n = {n}, n_traj = {n_traj}, t_end = {t_end}, dt = {dt}")
     print(f"  Rayleigh damping: alpha = {alpha}, beta = {beta}")
+    print(f"  Adam L1 lambda = {adam_l1_lambda:.3e}")
     print(
         f"  Forcing: amplitude = {force_amplitude}, omega = {force_omega:.4f}, "
         f"sigma_cols = {force_sigma_cols}, applied at row 0 (bottom)"
@@ -578,6 +586,8 @@ def main(
         f"K_err={stls_results[STLS_NAME]['K_err']:.3e}"
     )
 
+    adam_residual_name = format_adam_residual_name(adam_l1_lambda)
+
     residual_result = base.train_gradient_method(
         grad_problem["theta_train"],
         grad_problem["target_train"],
@@ -588,7 +598,7 @@ def main(
         n_states=grad_problem["n_states"],
         n_epochs=residual_epochs,
         lr=5e-2,
-        l1_lambda=0.0,
+        l1_lambda=adam_l1_lambda,
         proximal=False,
         snapshot_every=max(1, residual_epochs // 60),
         n_eig=5,
@@ -600,9 +610,9 @@ def main(
         n_total_dofs=data["N"],
     )
     grad_results = OrderedDict()
-    grad_results[ADAM_RESIDUAL_NAME] = residual_result
+    grad_results[adam_residual_name] = residual_result
     print(
-        f"  {ADAM_RESIDUAL_NAME}: train={residual_result['train_losses'][-1]:.3e} "
+        f"  {adam_residual_name}: train={residual_result['train_losses'][-1]:.3e} "
         f"test={residual_result['test_losses'][-1]:.3e} "
         f"K_err={residual_result['snap_K_err'][-1]:.3e}"
     )
@@ -709,6 +719,7 @@ if __name__ == "__main__":
     parser.add_argument("--residual-epochs", type=int, default=1500)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--beta", type=float, default=0.02)
+    parser.add_argument("--adam-l1-lambda", type=float, default=0.0)
     parser.add_argument("--force-amplitude", type=float, default=1.0)
     parser.add_argument("--force-omega", type=float, default=2.0 * np.pi)
     parser.add_argument("--force-sigma-cols", type=float, default=1.5)
@@ -727,6 +738,7 @@ if __name__ == "__main__":
         residual_epochs=args.residual_epochs,
         alpha=args.alpha,
         beta=args.beta,
+        adam_l1_lambda=args.adam_l1_lambda,
         force_amplitude=args.force_amplitude,
         force_omega=args.force_omega,
         force_sigma_cols=args.force_sigma_cols,

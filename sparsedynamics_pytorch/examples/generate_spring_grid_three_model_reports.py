@@ -908,6 +908,17 @@ def generate_report(
         K_preds,
         output_stem=output_dirs["figure_dir"] / "current_recovered_k_matrices",
     )
+    base.plot_stls_lambda_sweep(
+        stls_problem["K_true"],
+        stls_problem["theta_train"],
+        stls_problem["target_train"],
+        theta_test=stls_problem["theta_test"],
+        target_test=stls_problem["target_test"],
+        lam_values=base.STLS_DENSE_LAMBDA_SWEEP,
+        mask=None,
+        output_stem=output_dirs["figure_dir"] / "stls_dense_lambda_sweep_k_matrices",
+        return_base64=False,
+    )
 
     eig_blocks = []
     for name, res in grad_results.items():

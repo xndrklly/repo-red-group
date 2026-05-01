@@ -130,6 +130,172 @@ class SimulationResult:
     n: int
 
 
+@dataclass(frozen=True)
+class BlockAverageReduction:
+    """Block-averaging reduction operators for a scalar spring grid.
+
+    The restriction maps fine-grid free DOFs to coarse block averages, while
+    the prolongation maps coarse block values back to a block-constant fine
+    representation.
+    """
+
+    fine_grid_size: int
+    block_size: int
+    coarse_grid_size: int
+    free_dofs: np.ndarray
+    active_counts: np.ndarray
+    block_index_by_free_dof: np.ndarray
+    restriction: np.ndarray  # (N_coarse, n_free)
+    prolongation: np.ndarray  # (n_free, N_coarse)
+
+
+def build_block_average_reduction(
+    n: int,
+    block_size: int,
+    *,
+    free_dofs: Optional[Sequence[int]] = None,
+) -> BlockAverageReduction:
+    """Build block-averaging reduction operators for an ``n x n`` grid.
+
+    Parameters
+    ----------
+    n : int
+        Fine-grid side length.
+    block_size : int
+        Side length of each square averaging block. Must divide ``n``.
+    free_dofs : sequence of int, optional
+        Fine-grid DOFs retained in the state vector. When omitted, all
+        ``n * n`` DOFs are treated as active. When provided, the returned
+        operators are sized for that free-DOF ordering.
+
+    Returns
+    -------
+    BlockAverageReduction
+        Restriction/prolongation operators and block metadata.
+    """
+    if n < 1:
+        raise ValueError(f"n must be positive, got {n}")
+    if block_size < 1:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if n % block_size != 0:
+        raise ValueError(
+            f"grid size n={n} must be an integer multiple of block_size={block_size}"
+        )
+
+    N = n * n
+    if free_dofs is None:
+        free = np.arange(N, dtype=int)
+    else:
+        free = np.asarray(free_dofs, dtype=int)
+        if free.ndim != 1:
+            raise ValueError("free_dofs must be a 1D sequence of fine-grid indices")
+        if free.size == 0:
+            raise ValueError("free_dofs must contain at least one DOF")
+        if np.any((free < 0) | (free >= N)):
+            raise ValueError(
+                f"free_dofs entries must lie in [0, {N - 1}] for an {n}x{n} grid"
+            )
+        if np.unique(free).size != free.size:
+            raise ValueError("free_dofs must not contain duplicates")
+
+    coarse_n = n // block_size
+    coarse_N = coarse_n * coarse_n
+    rows = free // n
+    cols = free % n
+    block_rows = rows // block_size
+    block_cols = cols // block_size
+    block_index = block_rows * coarse_n + block_cols
+    active_counts = np.bincount(block_index, minlength=coarse_N)
+    if np.any(active_counts == 0):
+        empty = np.flatnonzero(active_counts == 0)
+        raise ValueError(
+            "Each coarse block must contain at least one active fine DOF; "
+            f"empty coarse block indices: {empty.tolist()}"
+        )
+
+    restriction = np.zeros((coarse_N, free.size), dtype=float)
+    restriction[block_index, np.arange(free.size)] = 1.0 / active_counts[block_index]
+
+    prolongation = np.zeros((free.size, coarse_N), dtype=float)
+    prolongation[np.arange(free.size), block_index] = 1.0
+
+    return BlockAverageReduction(
+        fine_grid_size=int(n),
+        block_size=int(block_size),
+        coarse_grid_size=int(coarse_n),
+        free_dofs=free.copy(),
+        active_counts=active_counts.astype(int, copy=False),
+        block_index_by_free_dof=block_index.astype(int, copy=False),
+        restriction=restriction,
+        prolongation=prolongation,
+    )
+
+
+def apply_block_average_reduction(
+    values: np.ndarray | Tensor,
+    reduction: BlockAverageReduction,
+) -> np.ndarray | Tensor:
+    """Apply a block-averaging restriction to vectors or time series.
+
+    ``values`` must use the same free-DOF ordering as ``reduction.free_dofs``.
+    Accepted shapes are ``(n_free,)`` and ``(..., n_free)``.
+    """
+    if isinstance(values, Tensor):
+        R_t = torch.as_tensor(
+            reduction.restriction,
+            device=values.device,
+            dtype=values.dtype,
+        )
+        if values.shape[-1] != R_t.shape[1]:
+            raise ValueError(
+                f"Expected last dimension {R_t.shape[1]}, got {values.shape[-1]}"
+            )
+        if values.ndim == 1:
+            return R_t @ values
+        return values @ R_t.T
+
+    arr = np.asarray(values, dtype=float)
+    if arr.shape[-1] != reduction.restriction.shape[1]:
+        raise ValueError(
+            f"Expected last dimension {reduction.restriction.shape[1]}, got {arr.shape[-1]}"
+        )
+    if arr.ndim == 1:
+        return reduction.restriction @ arr
+    return arr @ reduction.restriction.T
+
+
+def project_block_average_operator(
+    operator: np.ndarray | Tensor,
+    reduction: BlockAverageReduction,
+) -> np.ndarray | Tensor:
+    """Project a fine-grid free-DOF operator into the block-averaged space."""
+    if isinstance(operator, Tensor):
+        R_t = torch.as_tensor(
+            reduction.restriction,
+            device=operator.device,
+            dtype=operator.dtype,
+        )
+        P_t = torch.as_tensor(
+            reduction.prolongation,
+            device=operator.device,
+            dtype=operator.dtype,
+        )
+        if operator.shape != (P_t.shape[0], P_t.shape[0]):
+            raise ValueError(
+                "operator must have shape "
+                f"({P_t.shape[0]}, {P_t.shape[0]}), got {tuple(operator.shape)}"
+            )
+        return R_t @ operator @ P_t
+
+    arr = np.asarray(operator, dtype=float)
+    n_free = reduction.prolongation.shape[0]
+    if arr.shape != (n_free, n_free):
+        raise ValueError(
+            f"operator must have shape ({n_free}, {n_free}), got {arr.shape}"
+        )
+    return reduction.restriction @ arr @ reduction.prolongation
+
+
 def _to_dense_tensor(
     x: sp.spmatrix | np.ndarray | Tensor,
     *,
