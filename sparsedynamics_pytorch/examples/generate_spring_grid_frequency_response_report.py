@@ -139,6 +139,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <title>{report_title}</title>
+<script>
+window.MathJax = {{ tex: {{ inlineMath: [['$', '$'], ['\\\\(', '\\\\)']] }} }};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
        max-width: 1220px; margin: 2em auto; padding: 0 1em; color: #222; }}
@@ -173,6 +177,46 @@ code {{ background: #f5f5f5; padding: 0.1em 0.3em; border-radius: 3px; }}
 <li>Measurement noise on training data: {noise_description}</li>
 <li>Steady-state response is computed analytically by solving <code>(K - omega^2 M + i omega C) U = F0</code> at each omega.</li>
 </ul>
+
+<h2>Operator matrices</h2>
+<div class="note-box">
+<p>True vs learned stiffness operators on both grids. The top row shows the
+fine-grid <code>K_free</code> (90&times;90); the bottom row shows the projected
+coarse operator <code>K_rom = R_avg K_free P_block</code> and the learned ROM
+operator. Identical color scales per row make differences between true and
+learned matrices easy to spot.</p>
+</div>
+<img src="data:image/png;base64,{operator_matrix_b64}" />
+
+<h2>Training forcing</h2>
+<div class="note-box">
+<p>Each training trajectory is driven by a localized sinusoidal point load on the
+bottom row of the lattice, with the spatial profile a Gaussian on the column
+index $j$ and the temporal profile a sine wave at trajectory-specific
+frequency and phase:</p>
+<p style="text-align:center">
+$f_k(t,\\, x_j) \\;=\\; A \\,\\exp\\!\\left(-\\dfrac{{(j - j_{{c,k}})^2}}{{2\\sigma^2}}\\right)\\, \\sin(\\omega_k\\, t + \\phi_k), \\qquad i = 0,\\;\\; j = 0,\\dots,n-1$
+</p>
+<p>with $\\omega_k = \\omega_{{\\mathrm{{base}}}}\\,\\rho_k$,
+$\\rho_k\\in\\{{0.7,\\,1.0,\\,1.3,\\,1.7,\\,2.1,\\,2.7,\\,3.3,\\,4.1\\}}$,
+phase $\\phi_k = \\pi k / N_{{\\mathrm{{traj}}}}$, center column
+$j_{{c,k}}$ varied symmetrically around $(n-1)/2$, and amplitude $A$ and
+width $\\sigma$ held fixed across trajectories. The concrete values used for
+this run are:</p>
+{training_freq_table}
+<p>Heatmaps below show $f_k(t, x_j)$ on the bottom row over the training
+window for each trajectory.</p>
+</div>
+<img src="data:image/png;base64,{forcing_heatmap_b64}" />
+
+<h2>Training rollout: true vs Full vs lifted ROM</h2>
+<div class="note-box">
+<p>One-row, three-panel quiver animation of trajectory 0 from the training set:
+the data ($u(t)$ on the fine grid), the Full STLS rollout under identical
+forcing, and the ROM STLS rollout (lifted to the fine grid via $P_{{\\mathrm{{block}}}}$).
+This is the time-domain analogue of the frequency-response comparison below.</p>
+</div>
+{training_quiver_video_tag}
 
 <h2>Response curves</h2>
 <div class="note-box">
@@ -455,6 +499,63 @@ def make_side_by_side_heatmap_animation(
     return base.save_animation(anim, output_stem, fps=20)
 
 
+def plot_training_forcing_heatmaps(
+    force_fns: list,
+    *,
+    n: int,
+    t_end: float,
+    n_t: int = 200,
+    output_stem: Path | None,
+) -> str:
+    """One column per trajectory: heatmap of f(t, x_j) for the bottom-row force."""
+    n_traj = len(force_fns)
+    fig, axes = plt.subplots(
+        1, n_traj, figsize=(3.6 * n_traj, 4.4), constrained_layout=True, sharey=True,
+    )
+    if n_traj == 1:
+        axes = np.asarray([axes])
+    t_grid = np.linspace(0.0, t_end, n_t)
+    cols = np.arange(n, dtype=float)
+    vmax = 0.0
+    grids = []
+    for fn in force_fns:
+        params = getattr(fn, "bottom_force_params", None)
+        if params is None:
+            grid = np.zeros((n_t, n))
+        else:
+            sigma = max(float(params["sigma_cols"]), 1e-8)
+            spatial = np.exp(-((cols - float(params["center_col"])) ** 2) / (2.0 * sigma ** 2))
+            spatial = float(params["amplitude"]) * (spatial / spatial.max())
+            temporal = np.sin(float(params["omega"]) * t_grid + float(params["phase"]))
+            grid = np.outer(temporal, spatial)
+        grids.append(grid)
+        vmax = max(vmax, float(np.max(np.abs(grid))))
+    vmax = max(vmax, 1e-12)
+    image = None
+    for k, (ax, fn, grid) in enumerate(zip(axes, force_fns, grids)):
+        params = fn.bottom_force_params
+        image = ax.imshow(
+            grid,
+            origin="lower",
+            aspect="auto",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+            extent=[-0.5, n - 0.5, 0.0, t_end],
+        )
+        ax.set_title(
+            f"traj {k}: $\\omega={params['omega']:.2f}$, "
+            f"$j_c={params['center_col']:.1f}$, $\\phi={params['phase']:.2f}$"
+        )
+        ax.set_xlabel("Bottom-row column $j$")
+        if k == 0:
+            ax.set_ylabel("Time $t$")
+    if image is not None:
+        fig.colorbar(image, ax=axes, shrink=0.85, label="$f(t, x_j)$")
+    fig.suptitle("Per-trajectory training forcing on the bottom row", fontsize=13)
+    return base.maybe_save_for_html(fig, output_stem=output_stem, return_base64=True)
+
+
 def lift_rom_complex_to_fine(
     U_rom: np.ndarray,
     P_block: np.ndarray,
@@ -620,6 +721,99 @@ def main(
     figure_dir = output_dirs["figure_dir"]
     animation_dir = output_dirs["animation_dir"]
 
+    print("  Building K-matrix and training-context figures...")
+    operator_matrix_b64 = rom_vs_full.plot_operator_matrix_overview(
+        K_full_true=K_full_true,
+        K_full_pred=K_full_pred,
+        K_rom_true=K_rom_true_proj,
+        K_rom_pred=K_rom_pred,
+        output_stem=figure_dir / "operator_matrix_overview",
+    )
+    forcing_heatmap_b64 = plot_training_forcing_heatmaps(
+        train_force_fns,
+        n=n,
+        t_end=t_end,
+        output_stem=figure_dir / "training_forcing_heatmaps",
+    )
+
+    training_freq_rows = []
+    for k, fn in enumerate(train_force_fns):
+        p = fn.bottom_force_params
+        training_freq_rows.append(
+            f"<tr><td class=\"label\">{k}</td>"
+            f"<td>{p['omega']:.4f}</td>"
+            f"<td>{p['omega'] / (2.0 * np.pi):.4f}</td>"
+            f"<td>{p['center_col']:.2f}</td>"
+            f"<td>{p['phase']:.4f}</td>"
+            f"<td>{p['amplitude']:.2f}</td>"
+            f"<td>{p['sigma_cols']:.2f}</td></tr>"
+        )
+    training_freq_table = (
+        "<table><tr>"
+        "<th class=\"label\">Trajectory</th>"
+        "<th>$\\omega_k$ [rad/s]</th>"
+        "<th>$f_k$ [Hz]</th>"
+        "<th>$j_c$</th>"
+        "<th>$\\phi_k$ [rad]</th>"
+        "<th>$A$</th>"
+        "<th>$\\sigma$</th>"
+        "</tr>" + "".join(training_freq_rows) + "</table>"
+    )
+
+    print("  Rolling out trained models on training trajectory 0...")
+    rom_force_fn = rom_vs_full.make_reduced_force_fn(train_force_fns[0], reduction)
+    fine_true_rollout = data["trajectories"][0]
+    full_train_rollout = base.rollout_linear_model(
+        K_full_pred, free, n,
+        dt=data["dt"], t_end=data["t_end"],
+        u0_full=fine_true_rollout["u0_full"],
+        v0_full=fine_true_rollout["v0_full"],
+        device=device, simulation_backend="scipy", dtype=dtype,
+        damping_matrix=data["C_full"], force_fn=train_force_fns[0],
+    )
+    rom_train_rollout_native = base.rollout_linear_model(
+        K_rom_pred, rom_view["free"], rom_view["n"],
+        dt=rom_view["dt"], t_end=rom_view["t_end"],
+        u0_full=rom_view["trajectories"][0]["u0_full"],
+        v0_full=rom_view["trajectories"][0]["v0_full"],
+        device=device, simulation_backend="scipy", dtype=dtype,
+        damping_matrix=rom_view["C_full"], force_fn=rom_force_fn,
+    )
+    rom_train_rollout_lifted = rom_vs_full.lift_rom_rollout_to_fine(
+        rom_train_rollout_native, P_block, free, int(data["N"]),
+    )
+
+    train_rollouts_for_anim = {
+        "true": {
+            "times": fine_true_rollout["times"],
+            "U_full": fine_true_rollout["U_full"],
+        },
+        "full": {
+            "times": full_train_rollout["times"],
+            "U_full": full_train_rollout["U_full"],
+        },
+        "rom": {
+            "times": rom_train_rollout_lifted["times"],
+            "U_full": rom_train_rollout_lifted["U_full"],
+        },
+    }
+    train_anim_vmax = max(
+        float(np.max(np.abs(r["U_full"]))) for r in train_rollouts_for_anim.values()
+    )
+    train_anim_vmax = max(train_anim_vmax, 1e-12)
+    train_anim_vis_scale = 0.75 / train_anim_vmax
+    print("  Building training-rollout side-by-side quiver animation...")
+    training_quiver_assets = make_side_by_side_quiver_animation(
+        train_rollouts_for_anim, n,
+        title="Training trajectory 0: true vs Full vs lifted ROM rollouts",
+        output_stem=animation_dir / "training_rollout_side_by_side_quiver",
+        vis_scale=train_anim_vis_scale,
+    )
+    training_quiver_video_tag = base.render_video_tag(
+        out_path.parent, training_quiver_assets,
+        "Training rollout: true vs Full vs lifted ROM",
+    )
+
     print("  Building response curve figures...")
     response_curves_b64 = assemble_response_curve_figure(
         omegas=omegas, metrics_by_model=metrics_by_model,
@@ -784,6 +978,10 @@ def main(
         alpha=alpha,
         beta=beta,
         noise_description=noise_description,
+        operator_matrix_b64=operator_matrix_b64,
+        forcing_heatmap_b64=forcing_heatmap_b64,
+        training_freq_table=training_freq_table,
+        training_quiver_video_tag=training_quiver_video_tag,
         response_curves_b64=response_curves_b64,
         headline_curve_b64=headline_curve_b64,
         error_curves_b64=error_curves_b64,
