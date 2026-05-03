@@ -77,7 +77,7 @@ def train(eps, X, DX,
 
     eps_t = torch.tensor(eps, dtype=torch.float32, device=device)
 
-    # Pre-convert grad_psis to device tensors ONCE — avoids numpy→CUDA transfer
+    # Pre-convert grad_psis to device tensors ONCE — avoids numpy->CUDA transfer
     # on every closure call (~20x per L-BFGS epoch x 50 test functions = 1000 copies/epoch)
     grad_psis_t = [torch.tensor(gp, dtype=torch.float32, device=device)
                    for gp in grad_psis]
@@ -144,10 +144,6 @@ def train(eps, X, DX,
         model.train()
 
         if optimizer == 'lbfgs':
-            # cache_ref() is called ONCE here, before opt.step() triggers the
-            # closure. The closure is called ~20 times by the line search, but
-            # all those calls reuse the same cached reference correction.
-            model.cache_ref()
             def closure():
                 opt.zero_grad()
                 loss = compute_loss()
@@ -156,7 +152,6 @@ def train(eps, X, DX,
             loss_val_t = opt.step(closure)
             loss_val   = loss_val_t.item()
         else:
-            model.cache_ref()
             opt.zero_grad()
             loss_val_t = compute_loss()
             loss_val_t.backward()
@@ -192,7 +187,7 @@ def train(eps, X, DX,
                         'epoch': epoch + 1,
                         'losses': losses}, checkpoint_path)
             model = _cpu.to(device)
-            print(f"  [checkpoint saved → {checkpoint_path}  epoch {epoch+1}]")
+            print(f"  [checkpoint saved -> {checkpoint_path}  epoch {epoch+1}]")
 
     print("Done.")
     model = model.to('cpu')

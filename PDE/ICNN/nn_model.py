@@ -90,52 +90,10 @@ class ICNN(nn.Module):
         W = z @ A_out.T + self.B_out(z0)                   # (batch, 1)
         return W
 
-    def cache_ref(self):
-        """
-        Pre-compute the thermodynamic correction at the reference point (z0=0)
-        and cache it for use in forward().
-
-        Call this ONCE per optimizer step — before the batch of forward passes.
-        For L-BFGS this means at the top of the closure, not inside it, so the
-        cached values are reused across all ~20 line-search sub-steps per epoch.
-        For Adam, call it once before opt.step().
-
-        This avoids running a full second network forward+backward on every
-        closure evaluation, roughly halving per-epoch cost on large grids.
-        """
-        device = next(self.parameters()).device
-        dtype  = next(self.parameters()).dtype
-        with torch.enable_grad():
-            z0_ref = torch.zeros(1, 2, device=device, dtype=dtype,
-                                 requires_grad=True)
-            W_ref = self._forward_W(z0_ref)
-            grad_ref = torch.autograd.grad(
-                W_ref.sum(), z0_ref, create_graph=self.training
-            )[0]
-        # Keep graph-connected tensors for training (needed for weight grads),
-        # plain detached scalars for eval.
-        self._ref_W        = W_ref
-        self._ref_dWdI1    = grad_ref[:, 0:1]
-
-    def _get_ref(self, device, dtype):
-        """Return (W_ref, dWdI1_ref), computing inline if cache_ref() hasn't been called."""
-        if hasattr(self, '_ref_W'):
-            return self._ref_W, self._ref_dWdI1
-        # Fallback: compute inline (e.g. first inference call before any cache_ref)
-        with torch.enable_grad():
-            z0_ref = torch.zeros(1, 2, device=device, dtype=dtype, requires_grad=True)
-            W_ref = self._forward_W(z0_ref)
-            grad_ref = torch.autograd.grad(
-                W_ref.sum(), z0_ref, create_graph=self.training
-            )[0]
-        return W_ref, grad_ref[:, 0:1]
-
     def forward(self, eps_flat):
         """
         eps_flat : (batch, 3)  — [e11, e22, e12]
         Returns  : (batch, 3)  — [s11, s22, s12]
-
-        Call cache_ref() once before each optimizer step for best performance.
         """
         e11 = eps_flat[:, 0]
         e22 = eps_flat[:, 1]
@@ -157,8 +115,13 @@ class ICNN(nn.Module):
             #                                    because ∂W/∂I2|₀=0
             # Subtracting the I2 linear term (as the full ∇W·z0 correction does)
             # forces ∂W/∂I2|₀=0, which kills the linear shear modulus.
-            W_ref, dWdI1_ref = self._get_ref(z0.device, z0.dtype)
-            W = W - W_ref - z0[:, 0:1] * dWdI1_ref
+            z0_ref = torch.zeros(1, 2, device=z0.device, dtype=z0.dtype,
+                                 requires_grad=True)
+            W_ref = self._forward_W(z0_ref)
+            grad_ref = torch.autograd.grad(
+                W_ref.sum(), z0_ref, create_graph=self.training
+            )[0]
+            W = W - W_ref - z0[:, 0:1] * grad_ref[:, 0:1]
 
             grads = torch.autograd.grad(
                 W.sum(), z0, create_graph=self.training
