@@ -412,7 +412,7 @@ def main():
         hidden = 32
         layers = 3
         act_scale = 1/12
-        dropout = 0.2
+        dropout = 0.0  # must be 0 with L-BFGS (dropout makes closure stochastic)
         model, losses = train_model(
             eps_static, eval_grid, DX=DX,
             K=K, epochs=2000,
@@ -421,7 +421,7 @@ def main():
             optimizer='lbfgs',
             base_lr=1.0,
             lr_schedule='constant',
-            reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor='auto',
+            reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor=1e2,  # low enough to avoid NaN at init
             checkpoint_path=model_path, checkpoint_every=200,
             seed=0
         )

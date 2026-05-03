@@ -137,7 +137,9 @@ def pde_loss(model, eps, grad_psis, DX):
     ----------
     model     : ICNN
     eps       : (M, M, 3) numpy array or torch tensor -- strain field
-    grad_psis : list of (M, M, 2) numpy arrays        -- precomputed gradients
+    grad_psis : list of (M, M, 2) numpy arrays OR pre-converted torch tensors
+                Pass pre-converted CUDA tensors for best performance
+                (avoids numpy→GPU transfer on every closure call).
     DX        : float                                 -- grid spacing
 
     Returns
@@ -152,7 +154,11 @@ def pde_loss(model, eps, grad_psis, DX):
 
     loss = torch.tensor(0.0, device=device)
     for gp in grad_psis:
-        gp_t = torch.tensor(gp, dtype=torch.float32, device=device)
+        # Accept either a pre-converted tensor (fast path) or numpy (fallback)
+        if isinstance(gp, torch.Tensor):
+            gp_t = gp
+        else:
+            gp_t = torch.tensor(gp, dtype=torch.float32, device=device)
         R = weak_residual(model, eps, gp_t, DX)
         loss = loss + (R ** 2).sum()
 

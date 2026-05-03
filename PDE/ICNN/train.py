@@ -77,6 +77,11 @@ def train(eps, X, DX,
 
     eps_t = torch.tensor(eps, dtype=torch.float32, device=device)
 
+    # Pre-convert grad_psis to device tensors ONCE — avoids numpy→CUDA transfer
+    # on every closure call (~20x per L-BFGS epoch x 50 test functions = 1000 copies/epoch)
+    grad_psis_t = [torch.tensor(gp, dtype=torch.float32, device=device)
+                   for gp in grad_psis]
+
     # Pre-convert boundary strain once if provided
     bdry_t = (torch.tensor(bdry_eps, dtype=torch.float32, device=device)
               if bdry_eps is not None else None)
@@ -116,7 +121,7 @@ def train(eps, X, DX,
         print(f"rxn_factor = {rxn_factor:.3e}  (fixed default)")
 
     def compute_loss():
-        loss = pde_loss(model, eps_t, grad_psis, DX)
+        loss = pde_loss(model, eps_t, grad_psis_t, DX)
         if reaction_force is not None and bdry_t is not None:
             rxn_loss = boundary_reaction_loss(model, bdry_t, reaction_force, DX)
             loss = loss + rxn_factor * rxn_loss
@@ -139,6 +144,10 @@ def train(eps, X, DX,
         model.train()
 
         if optimizer == 'lbfgs':
+            # cache_ref() is called ONCE here, before opt.step() triggers the
+            # closure. The closure is called ~20 times by the line search, but
+            # all those calls reuse the same cached reference correction.
+            model.cache_ref()
             def closure():
                 opt.zero_grad()
                 loss = compute_loss()
@@ -147,6 +156,7 @@ def train(eps, X, DX,
             loss_val_t = opt.step(closure)
             loss_val   = loss_val_t.item()
         else:
+            model.cache_ref()
             opt.zero_grad()
             loss_val_t = compute_loss()
             loss_val_t.backward()
