@@ -6,10 +6,14 @@ Expects each case folder under <repo>/data/static/<case>/lattice_static.npz
 (e.g. names from spring_grid_static: 100_1N, 100_10N, 100_1N_Duffing, ...).
 Generate those with:  data_generation/generate_static_cases.py (or .bat).
 
+By default each case runs ``run.py`` with ``--n-ensemble 10`` (10 independent
+training runs; ``train_ensemble`` keeps the best by minimum loss).
+
 Usage (from repo root or PDE/ICNN):
   python train_static_cases.py
   python train_static_cases.py --cases 100_1N 100_10N --dry-run
-  python train_static_cases.py -- python run.py extra args not used here
+  python train_static_cases.py --n-ensemble 5
+  python train_static_cases.py -- --epochs 800
 """
 
 from __future__ import annotations
@@ -25,6 +29,13 @@ DEFAULT_CASES = [
     '100_1N_Duffing',
     '100_10N_Duffing',
 ]
+
+
+def _argv_sets_n_ensemble(argv: list[str]) -> bool:
+    for tok in argv:
+        if tok == '--n-ensemble' or tok.startswith('--n-ensemble='):
+            return True
+    return False
 
 
 def main() -> int:
@@ -48,9 +59,16 @@ def main() -> int:
         help='Print commands only',
     )
     parser.add_argument(
+        '--n-ensemble',
+        type=int,
+        default=10,
+        help='Number of independent training runs per case (best kept). '
+             'Ignored if you pass --n-ensemble via -- ...',
+    )
+    parser.add_argument(
         'run_py_args',
         nargs=argparse.REMAINDER,
-        help='Extra args passed to run.py after -- (e.g. -- --n-ensemble 3)',
+        help='Extra args for run.py after -- (overrides duplicate flags there)',
     )
     args = parser.parse_args()
     extra = args.run_py_args
@@ -83,8 +101,10 @@ def main() -> int:
             '--data',
             str(npz),
             '--force-train',
-            *extra,
         ]
+        if not _argv_sets_n_ensemble(extra):
+            cmd += ['--n-ensemble', str(args.n_ensemble)]
+        cmd += list(extra)
         print(f'--- {case} ---')
         print(' ', ' '.join(cmd))
         if args.dry_run:
