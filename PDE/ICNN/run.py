@@ -1,16 +1,18 @@
 """
 run.py  —  NN-EUCLID pipeline  (Thakolkaran et al. 2022)
 ---------------------------------------------------------
-Matches paper exactly:
-  - Adam + cyclic LR (0.001->0.1, every 100 epochs)
-  - 500 epochs per run, dropout 0.2 during training
-  - Ensemble of 5 runs, keep best (within 20% acceptance)
-  - Nodal force balance loss (eq. 22) — no rxn_factor needed
+Training (see train.py):
+  - Phase A: Adam + CyclicLR (defaults 0.001 <-> 0.01, triangular cycle)
+  - Phase B: L-BFGS on best Adam weights (dropout off)
+  - w_rxn from initial loss_free / loss_rxn (no fixed 1e6)
+  - Reaction loss: mean σ_yy vs F/(M·DX) on **every** row (flat R_y(y))
+  - Ensemble of 5 runs by default, keep best (within 20% acceptance)
 
 Usage (from PDE/ICNN/ or any directory):
     python run.py
     python run.py --condition static --grid-size 100
     python run.py --data /abs/path/to/lattice_static.npz
+    python run.py --data .../data/static/100_1N/lattice_static.npz   # spring_grid_static naming
     python run.py --load-model   # skip training, load saved best model
     python run.py --force-train  # retrain even if checkpoint exists
 
@@ -29,7 +31,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from smoothing import GaussianSmoother, make_eval_grid
 from train import train_ensemble, _save
-from nodal_loss import nodal_loss
+from nodal_loss import nodal_loss, DEFAULT_W_RXN
 from nn_model import ICNN
 
 
@@ -75,6 +77,28 @@ def opath(results_dir, fname):
     return os.path.join(results_dir, fname)
 
 
+def _eval_grid_spacing(eval_grid):
+    """Mean Δx along a row and mean Δy along a column (uniform grid)."""
+    dx = float(np.mean(np.diff(eval_grid[0, :, 0])))
+    dy = float(np.mean(np.diff(eval_grid[:, 0, 1])))
+    return dx, dy
+
+
+def _check_dx_dy_vs_dataset(DX, eval_grid, rtol=1e-4):
+    """
+    ``nodal_loss`` uses ``DX`` from the dataset for σ_target and finite
+    differences. Diagnostics should use the same spacing for ∫σ_yy dx.
+    """
+    dx_g, dy_g = _eval_grid_spacing(eval_grid)
+    print(f'  Grid spacing: Δx={dx_g:.6g}  Δy={dy_g:.6g}  (dataset DX={DX:.6g})')
+    for name, v in ('Δx', dx_g), ('Δy', dy_g):
+        if abs(v - DX) > rtol * max(abs(DX), 1e-30):
+            print(f'  WARNING: {name} differs from DX by '
+                  f'{abs(v - DX) / max(abs(DX), 1e-30):.2e} (rtol={rtol}); '
+                  f'vertical resultant uses DX to match the loss.')
+    return dx_g, dy_g
+
+
 # -------------------------------------------------------------------- plots --
 
 def plot_loss(all_losses, best_idx, out):
@@ -96,24 +120,26 @@ def plot_loss(all_losses, best_idx, out):
     print(f'Saved  {out}')
 
 
-def plot_loss_breakdown(model, eps_static, DX, F_reaction_y, all_losses, best_idx, out):
+def plot_loss_breakdown(model, eps_static, DX, F_reaction_y, all_losses, best_idx, out,
+                        w_rxn=None):
     """
     Two-panel plot showing the free-node and reaction contributions separately
     for the best run, plus the final numerical values.
 
     This is the PRIMARY diagnostic for whether training worked:
       - loss_free should be driving toward zero (equilibrium satisfied)
-      - loss_rxn  should be near zero (reaction force matched)
-      - If loss_free is low but loss_rxn is high: stress scale is wrong
+      - loss_rxn  should be near zero (mean σ_yy on every row vs F/(M·DX))
+      - If loss_free is low but loss_rxn is high: stress scale / flat R_y off
       - If loss_rxn is low but loss_free is high: stress is non-equilibrated
       - If both are low: training succeeded
     """
     device = torch.device('cpu')
     eps_t  = torch.tensor(eps_static, dtype=torch.float32, device=device)
 
+    w = float(DEFAULT_W_RXN if w_rxn is None else w_rxn)
     model.eval()
     with torch.no_grad():
-        _, lf, lr = nodal_loss(model, eps_t, DX, F_reaction_y)
+        _, lf, lr = nodal_loss(model, eps_t, DX, F_reaction_y, w_rxn=w)
     lf_val = lf.item()
     lr_val = lr.item()
 
@@ -122,7 +148,7 @@ def plot_loss_breakdown(model, eps_static, DX, F_reaction_y, all_losses, best_id
     # Panel 1: loss breakdown bar chart
     ax = axes[0]
     bars = ax.bar(['Interior\nequilibrium\n(loss_free)',
-                   'Reaction\nforce\n(loss_rxn)'],
+                   'Flat slice\nresultant\n(loss_rxn)'],
                   [lf_val, lr_val],
                   color=['steelblue', 'tomato'], width=0.5)
     ax.set_yscale('log')
@@ -144,10 +170,11 @@ def plot_loss_breakdown(model, eps_static, DX, F_reaction_y, all_losses, best_id
     ax2.grid(True, which='both', alpha=0.3)
     ax2.legend(fontsize=8)
 
+    total_train = lf_val + w * lr_val
     fig.suptitle(
         f'Training diagnostics  |  '
         f'free={lf_val:.3e}  rxn={lr_val:.3e}  '
-        f'total={lf_val+lr_val:.3e}',
+        f'w_rxn={w:.3e}  total={total_train:.3e}',
         fontsize=10
     )
     fig.tight_layout()
@@ -205,11 +232,12 @@ def plot_stress_strain(model, eps_static, out):
         for s in range(3):
             ax.plot(e_range, sigma[:, s], color=colors[s],
                     label=sig_labels[s], lw=1.8)
-        mask = np.abs(e_range) <= 0.1*e_max
+        # Small-strain slope of the *driven* stress–strain pair (not always σ11)
+        mask = np.abs(e_range) <= 0.1 * e_max
         if mask.sum() > 3:
-            slope = np.polyfit(e_range[mask], sigma[mask, 0], 1)[0]
-            ax.plot(e_range, slope*e_range, 'k--', lw=1.2,
-                    label=fr'tangent $\approx$ {slope:.3f}')
+            slope = np.polyfit(e_range[mask], sigma[mask, comp], 1)[0]
+            ax.plot(e_range, slope * e_range, 'k--', lw=1.2,
+                    label=fr'small-strain slope $\approx$ {slope:.3f}')
         ax.axhline(0, color='k', lw=0.5); ax.axvline(0, color='k', lw=0.5)
         ax.ticklabel_format(axis='both', style='sci', scilimits=(0,0))
         ax.set_xlabel(comp_labels[comp]); ax.set_ylabel('stress')
@@ -261,14 +289,21 @@ def plot_pde_residual(model, eps_static, eval_grid, out):
     print(f'Saved  {out}')
 
 
-def plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y, out):
+def plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y, out,
+                            row_sum_dx=None):
     """
     ∫ σ_yy dx vs height. At convergence should be flat and equal to F_reaction_y.
     The red dashed line shows the target reaction force.
     CV < 0.05 means the resultant is flat — global equilibrium satisfied.
+
+    ``row_sum_dx`` should match ``DX`` in ``nodal_loss`` (dataset nominal
+    spacing). If None, falls back to mean Δx from ``eval_grid``.
     """
-    M  = eval_grid.shape[0]
-    dx = float(eval_grid[0, 1, 0] - eval_grid[0, 0, 0])
+    M = eval_grid.shape[0]
+    if row_sum_dx is not None:
+        dx = float(row_sum_dx)
+    else:
+        dx, _ = _eval_grid_spacing(eval_grid)
     model.eval()
     with torch.no_grad():
         sigma_f = model(torch.tensor(
@@ -330,7 +365,22 @@ def main():
     parser.add_argument('--load-model', action='store_true')
     parser.add_argument('--force-train', action='store_true')
     parser.add_argument('--n-ensemble', type=int, default=5)
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=600,
+                        help='Adam (phase A) epochs')
+    parser.add_argument('--max-lr', type=float, default=0.01,
+                        help='CyclicLR peak learning rate')
+    parser.add_argument('--cycle-steps', type=int, default=50,
+                        help='CyclicLR step_size_up and step_size_down')
+    parser.add_argument('--lbfgs-epochs', type=int, default=400,
+                        help='L-BFGS outer steps (0 to skip phase B)')
+    parser.add_argument('--lbfgs-lr', type=float, default=0.1,
+                        help='L-BFGS step size (CUDA: try 0.05–0.15 if NaNs)')
+    parser.add_argument('--lbfgs-max-iter', type=int, default=30,
+                        help='L-BFGS max_iter per outer step')
+    parser.add_argument('--lbfgs-tol-grad', type=float, default=1e-10,
+                        help='L-BFGS gradient tolerance (inf norm)')
+    parser.add_argument('--lbfgs-tol-change', type=float, default=1e-12,
+                        help='L-BFGS loss change tolerance')
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -368,6 +418,7 @@ def main():
     np.savez(opath(results_dir, 'smoothed_data.npz'),
              eval_grid=eval_grid, u_hat=u_hat, eps=eps)
     print(f'Saved  {opath(results_dir, "smoothed_data.npz")}')
+    _check_dx_dy_vs_dataset(DX, eval_grid)
 
     # Architecture — paper Table A.1: 64 neurons, 3 hidden layers
     hidden, layers, act_scale, dropout = 64, 3, 1/12, 0.2
@@ -375,6 +426,8 @@ def main():
     # Train or load
     auto_load = os.path.exists(model_path) and not args.force_train
     use_load  = args.load_model or auto_load
+
+    w_rxn_plot = float(DEFAULT_W_RXN)
 
     if use_load:
         print(f'Loading model from {model_path}')
@@ -386,21 +439,30 @@ def main():
         model.eval()
         all_losses = [ckpt.get('losses', [])]
         best_idx   = 0
+        w_rxn_plot = float(ckpt.get('w_rxn', DEFAULT_W_RXN))
         print('Loaded (training skipped)')
     else:
         ckpt_dir = os.path.join(results_dir, 'ensemble_checkpoints')
-        best_model, all_losses, best_idx = train_ensemble(
+        best_model, all_losses, best_idx, w_rxn_best = train_ensemble(
             eps_static, DX, F_reaction_y,
             hidden=hidden, layers=layers,
             act_scale=act_scale, dropout=dropout,
-            epochs=args.epochs,
-            base_lr=0.001, max_lr=0.1, cycle_epochs=100,
+            adam_epochs=args.epochs,
+            base_lr=0.001,
+            max_lr=args.max_lr,
+            cycle_steps=args.cycle_steps,
+            lbfgs_epochs=args.lbfgs_epochs,
+            lbfgs_lr=args.lbfgs_lr,
+            lbfgs_max_iter=args.lbfgs_max_iter,
+            lbfgs_tol_grad=args.lbfgs_tol_grad,
+            lbfgs_tol_change=args.lbfgs_tol_change,
             n_ensemble=args.n_ensemble,
             checkpoint_dir=ckpt_dir,
         )
         model = best_model
+        w_rxn_plot = float(w_rxn_best)
         _save(model, all_losses[best_idx], hidden, layers,
-              act_scale, dropout, best_idx, model_path)
+              act_scale, dropout, best_idx, model_path, w_rxn=w_rxn_plot)
         print(f'Best model saved -> {model_path}')
 
     # Plots
@@ -410,7 +472,8 @@ def main():
               opath(results_dir, 'loss_curve.png'))
     plot_loss_breakdown(model, eps_static, DX, F_reaction_y,
                         all_losses, best_idx,
-                        opath(results_dir, 'loss_breakdown.png'))
+                        opath(results_dir, 'loss_breakdown.png'),
+                        w_rxn=w_rxn_plot)
     plot_stress_field(model, eps_static, eval_grid,
                       opath(results_dir, 'stress_fields.png'))
     plot_stress_strain(model, eps_static,
@@ -418,7 +481,8 @@ def main():
     plot_pde_residual(model, eps_static, eval_grid,
                       opath(results_dir, 'pde_residual.png'))
     plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y,
-                            opath(results_dir, 'vertical_resultant.png'))
+                            opath(results_dir, 'vertical_resultant.png'),
+                            row_sum_dx=DX)
 
     print(f'\nAll done.  Results in {results_dir}')
 

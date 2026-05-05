@@ -111,14 +111,15 @@ class ICNN(nn.Module):
                                 requires_grad=True)
             W_ref = self._forward_W(z_ref)
             dW_ref = torch.autograd.grad(
-                W_ref.sum(), z_ref, create_graph=self.training
+                W_ref.sum(), z_ref,
+                create_graph=torch.is_grad_enabled(),
             )[0]                                      # (1, 2): [dW/dI1, dW/dI2]
 
             # Subtract W(0) + (dW/dI1|_0)*I1  only
             W_c = W - W_ref - z0[:, 0:1] * dW_ref[:, 0:1]
 
             grads = torch.autograd.grad(
-                W_c.sum(), z0, create_graph=self.training
+                W_c.sum(), z0, create_graph=torch.is_grad_enabled(),
             )[0]                                      # (N, 2)
 
         dWdI1, dWdI2 = grads[:, 0], grads[:, 1]
