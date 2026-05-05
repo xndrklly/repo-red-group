@@ -1,0 +1,2 @@
+def train_single(eps_t, DX, F_reaction_y,
+                 hidden=64, layers=3, act_scale=1/12, dropout=0.2,

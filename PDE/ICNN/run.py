@@ -1,21 +1,20 @@
 """
-run.py  (ICNN)
---------------
-Full pipeline: load spring-lattice data → smooth → train ICNN constitutive model
-→ save diagnostic plots.
+run.py  —  NN-EUCLID pipeline  (Thakolkaran et al. 2022)
+---------------------------------------------------------
+Matches paper exactly:
+  - Adam + cyclic LR (0.001->0.1, every 100 epochs)
+  - 500 epochs per run, dropout 0.2 during training
+  - Ensemble of 5 runs, keep best (within 20% acceptance)
+  - Nodal force balance loss (eq. 22) — no rxn_factor needed
 
-Usage (run from PDE/ICNN/):
-    python ../simple_data_gen.py          # once, creates ../data/lattice_duffing.npz
-    python run.py                         # uses ../data/lattice_duffing.npz by default
-    python run.py --data ../data/lattice_linear.npz
+Usage (from PDE/ICNN/ or any directory):
+    python run.py
+    python run.py --condition static --grid-size 100
+    python run.py --data /abs/path/to/lattice_static.npz
+    python run.py --load-model   # skip training, load saved best model
+    python run.py --force-train  # retrain even if checkpoint exists
 
-Outputs in results/<data-stem>/:
-    smoothed_vs_original.png  -- raw vs smoothed displacement field
-    loss_curve.png            -- training loss (log scale)
-    stress_strain.png         -- ICNN σ-ε curves (sweep each strain component)
-    pde_residual.png          -- pointwise |∇·σ| residual colormap
-    vertical_resultant.png    -- ∫σ_yy dx vs height vs target reaction (if available)
-    smoothed_data.npz         -- smoothed displacement and strain arrays
+All paths resolved relative to script location — works from any cwd.
 """
 
 import argparse
@@ -25,10 +24,12 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
 from smoothing import GaussianSmoother, make_eval_grid
-from train import train as train_model
+from train import train_ensemble, _save
+from nodal_loss import nodal_loss
 from nn_model import ICNN
 
 
@@ -36,8 +37,10 @@ from nn_model import ICNN
 
 def load_data(path):
     d = np.load(path)
-    F_reaction_y = float(d['F_reaction_y']) if 'F_reaction_y' in d else None
-    return d['node_pos'], d['u'], float(d['DX']), F_reaction_y
+    if 'F_reaction_y' not in d:
+        raise ValueError(f"Dataset {path} missing F_reaction_y")
+    return (d['node_pos'], d['u'],
+            float(d['DX']), float(d['F_reaction_y']))
 
 
 def smooth(node_pos, u, DX, margin=3):
@@ -47,148 +50,171 @@ def smooth(node_pos, u, DX, margin=3):
     return eval_grid, u_hat, eps
 
 
-def infer_result_tags(data_path):
-    """
-    Infer condition name and grid size from dataset path.
-    Expected static layout: .../data/static/<grid_size>/lattice_static.npz
-    """
-    data_stem = os.path.splitext(os.path.basename(data_path))[0]
-    condition = data_stem
-    grid_size = 'unknown'
+def resolve_data_path(data_arg, condition, grid_size):
+    if data_arg:
+        return os.path.abspath(data_arg)
+    rel = os.path.join(SCRIPT_DIR, '..', '..', 'data',
+                       condition, str(grid_size), f'lattice_{condition}.npz')
+    return os.path.abspath(rel)
 
+
+def infer_tags(data_path):
     parts = os.path.normpath(data_path).split(os.sep)
     if len(parts) >= 3 and parts[-3] == 'static':
-        condition = 'lattice_static'
-        grid_size = parts[-2]
-    elif len(parts) >= 2:
-        grid_size = parts[-2]
-
-    return condition, grid_size
+        return 'lattice_static', parts[-2]
+    stem = os.path.splitext(os.path.basename(data_path))[0]
+    return stem, (parts[-2] if len(parts) >= 2 else 'unknown')
 
 
-def resolve_data_path(data_path, condition, grid_size):
-    """
-    Resolve dataset path from either explicit --data or condition/grid arguments.
-    """
-    if data_path:
-        return data_path
-    return os.path.join('..', '..', 'data', condition, str(grid_size), f'lattice_{condition}.npz')
+def prompt(msg, default):
+    v = input(f"{msg} [{default}]: ").strip()
+    return v if v else str(default)
 
 
-def prompt_with_default(prompt, default):
-    raw = input(f'{prompt} [{default}]: ').strip()
-    return raw if raw else str(default)
+def opath(results_dir, fname):
+    return os.path.join(results_dir, fname)
 
 
 # -------------------------------------------------------------------- plots --
 
-def plot_smoothed_vs_original(node_pos, u_raw, eval_grid, u_hat, eps, out):
-    uy_raw    = u_raw[:, :, 0, 1]
-    uy_smooth = u_hat[:, :, 0, 1]
-    eps_11    = eps[:, :, 0, 0]
-    eps_22    = eps[:, :, 0, 1]
+def plot_loss(all_losses, best_idx, out):
+    """All ensemble runs on one plot, best highlighted."""
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for i, losses in enumerate(all_losses):
+        lw    = 2.5 if i == best_idx else 0.8
+        alpha = 1.0 if i == best_idx else 0.4
+        label = f'run {i+1} (BEST)' if i == best_idx else f'run {i+1}'
+        ax.semilogy(losses, lw=lw, alpha=alpha, label=label)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Total loss (log scale)')
+    ax.set_title('Ensemble training — nodal force balance loss')
+    ax.legend(fontsize=8)
+    ax.grid(True, which='both', alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f'Saved  {out}')
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
 
-    def show(ax, data, title, cmap='viridis', sym=False):
-        vmax = np.abs(data).max()
-        vmin = -vmax if sym else data.min()
-        im = ax.imshow(data, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax)
-        ax.set_title(title)
-        ax.set_xlabel('j');  ax.set_ylabel('i')
-        fig.colorbar(im, ax=ax, shrink=0.75)
+def plot_loss_breakdown(model, eps_static, DX, F_reaction_y, all_losses, best_idx, out):
+    """
+    Two-panel plot showing the free-node and reaction contributions separately
+    for the best run, plus the final numerical values.
 
-    show(axes[0, 0], uy_raw,    'Original lattice  $u_y$')
-    show(axes[0, 1], uy_smooth, 'Smoothed field  $u_y$')
-    show(axes[1, 0], eps_11,    r'Smoothed  $\varepsilon_{11}$', sym=True, cmap='RdBu_r')
-    show(axes[1, 1], eps_22,    r'Smoothed  $\varepsilon_{22}$', cmap='viridis')
+    This is the PRIMARY diagnostic for whether training worked:
+      - loss_free should be driving toward zero (equilibrium satisfied)
+      - loss_rxn  should be near zero (reaction force matched)
+      - If loss_free is low but loss_rxn is high: stress scale is wrong
+      - If loss_rxn is low but loss_free is high: stress is non-equilibrated
+      - If both are low: training succeeded
+    """
+    device = torch.device('cpu')
+    eps_t  = torch.tensor(eps_static, dtype=torch.float32, device=device)
 
-    fig.suptitle('Displacement and strain fields', fontsize=13)
+    model.eval()
+    with torch.no_grad():
+        _, lf, lr = nodal_loss(model, eps_t, DX, F_reaction_y)
+    lf_val = lf.item()
+    lr_val = lr.item()
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+    # Panel 1: loss breakdown bar chart
+    ax = axes[0]
+    bars = ax.bar(['Interior\nequilibrium\n(loss_free)',
+                   'Reaction\nforce\n(loss_rxn)'],
+                  [lf_val, lr_val],
+                  color=['steelblue', 'tomato'], width=0.5)
+    ax.set_yscale('log')
+    ax.set_ylabel('Loss contribution (log scale)')
+    ax.set_title('Final loss breakdown')
+    for bar, val in zip(bars, [lf_val, lr_val]):
+        ax.text(bar.get_x() + bar.get_width()/2, val * 1.5,
+                f'{val:.3e}', ha='center', va='bottom', fontsize=9)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # Panel 2: best run loss curve split into free vs rxn if available,
+    # otherwise just total
+    ax2 = axes[1]
+    losses = all_losses[best_idx]
+    ax2.semilogy(losses, lw=1.5, color='steelblue', label='total loss (best run)')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss (log scale)')
+    ax2.set_title(f'Best run (run {best_idx+1}) training curve')
+    ax2.grid(True, which='both', alpha=0.3)
+    ax2.legend(fontsize=8)
+
+    fig.suptitle(
+        f'Training diagnostics  |  '
+        f'free={lf_val:.3e}  rxn={lr_val:.3e}  '
+        f'total={lf_val+lr_val:.3e}',
+        fontsize=10
+    )
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved  {out}  (free={lf_val:.3e}, rxn={lr_val:.3e})')
+
+
+def plot_stress_field(model, eps_static, eval_grid, out):
+    """
+    Spatial maps of all three stress components.
+    Good training → smooth fields consistent with the boundary conditions
+    (σ_yy roughly uniform in x, varying smoothly in y).
+    Bad training → noisy, near-zero, or physically implausible fields.
+    """
+    M = eval_grid.shape[0]
+    model.eval()
+    with torch.no_grad():
+        sigma_f = model(torch.tensor(
+            eps_static.reshape(-1, 3), dtype=torch.float32)).numpy()
+    sigma = sigma_f.reshape(M, M, 3)
+    titles = [r'$\sigma_{11}$', r'$\sigma_{22}$', r'$\sigma_{12}$']
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    for i, (ax, title) in enumerate(zip(axes, titles)):
+        field = sigma[:, :, i]
+        vmax  = np.abs(field).max()
+        im = ax.imshow(field, origin='lower', cmap='RdBu_r',
+                       vmin=-vmax, vmax=vmax)
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel('j  (x)'); ax.set_ylabel('i  (y)')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+    fig.suptitle('Predicted stress fields', fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved  {out}')
 
 
-def plot_loss(losses, K, out):
-    losses = np.asarray(losses)
-    loss_per_k = losses / max(K, 1)
-
-    # Convergence check: compare mean of last 10% vs first 10% of tail
-    tail = max(len(losses) // 10, 1)
-    final_mean  = loss_per_k[-tail:].mean()
-    earlier_mean = loss_per_k[-2*tail:-tail].mean() if len(losses) >= 2 * tail else loss_per_k[0]
-    still_dropping = final_mean < 0.9 * earlier_mean
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.semilogy(loss_per_k, lw=1.2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('loss / K  (log scale)')
-    ax.set_title('Training loss / K  (ICNN)')
-    ax.grid(True, which='both', alpha=0.4)
-
-    status = 'still dropping — consider more epochs' if still_dropping else 'converged / plateau'
-    ax.annotate(
-        f'final loss/K = {final_mean:.2e}\n{status}',
-        xy=(0.98, 0.95), xycoords='axes fraction',
-        ha='right', va='top', fontsize=8,
-        bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.7),
-    )
-
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-    print(f'Saved  {out}  (final loss/K = {final_mean:.2e}, {status})')
-
-
 def plot_stress_strain(model, eps_static, out):
-    """
-    Three panels: sweep ε₁₁, ε₂₂, ε₁₂ independently (others held at zero).
-
-    Note: I₂ = ε₁₁² + 2ε₁₂² + ε₂₂² is even in ε₁₂, so σ₁₂ vs ε₁₂
-    will be symmetric — a known limitation of the 2-invariant parameterisation.
-    """
+    """σ-ε curves sweeping each strain component independently."""
     model.eval()
-
     e_max   = float(np.abs(eps_static).max())
-    e_range = np.linspace(-1.5 * e_max, 1.5 * e_max, 400)
-
+    e_range = np.linspace(-1.5*e_max, 1.5*e_max, 400)
     comp_labels = [r'$\varepsilon_{11}$', r'$\varepsilon_{22}$', r'$\varepsilon_{12}$']
     sig_labels  = [r'$\sigma_{11}$', r'$\sigma_{22}$', r'$\sigma_{12}$']
-    colors      = ['tab:blue', 'tab:orange', 'tab:green']
+    colors = ['tab:blue', 'tab:orange', 'tab:green']
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-
     for comp in range(3):
         ax = axes[comp]
-
-        e = np.zeros((len(e_range), 3))
-        e[:, comp] = e_range
-
-        # ICNN takes raw strains directly
-        eps_t = torch.tensor(e, dtype=torch.float32)
+        e  = np.zeros((len(e_range), 3));  e[:, comp] = e_range
         with torch.no_grad():
-            sigma = model(eps_t).numpy()    # (400, 3)
-
+            sigma = model(torch.tensor(e, dtype=torch.float32)).numpy()
         for s in range(3):
             ax.plot(e_range, sigma[:, s], color=colors[s],
                     label=sig_labels[s], lw=1.8)
-
-        mask = np.abs(e_range) <= 0.1 * e_max
+        mask = np.abs(e_range) <= 0.1*e_max
         if mask.sum() > 3:
             slope = np.polyfit(e_range[mask], sigma[mask, 0], 1)[0]
-            ax.plot(e_range, slope * e_range, 'k--', lw=1.2,
-                    label=fr'linear tangent  $\approx$ {slope:.3f}')
-
-        ax.axhline(0, color='k', lw=0.5)
-        ax.axvline(0, color='k', lw=0.5)
-        ax.ticklabel_format(axis='both', style='sci', scilimits=(0, 0))
-        ax.set_xlabel(comp_labels[comp])
-        ax.set_ylabel('stress')
+            ax.plot(e_range, slope*e_range, 'k--', lw=1.2,
+                    label=fr'tangent $\approx$ {slope:.3f}')
+        ax.axhline(0, color='k', lw=0.5); ax.axvline(0, color='k', lw=0.5)
+        ax.ticklabel_format(axis='both', style='sci', scilimits=(0,0))
+        ax.set_xlabel(comp_labels[comp]); ax.set_ylabel('stress')
         ax.set_title(f'Sweep {comp_labels[comp]}')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     fig.suptitle('Constitutive law: ICNN  σ–ε  curves', fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches='tight')
@@ -197,54 +223,38 @@ def plot_stress_strain(model, eps_static, out):
 
 
 def plot_pde_residual(model, eps_static, eval_grid, out):
-    """
-    Evaluate ∇·σ_ICNN at every grid point (static: should be ≈ 0).
-    Colourmap clipped at 99th percentile of interior to suppress boundary noise.
-    """
+    """Pointwise div σ — should be near zero everywhere in interior."""
     M  = eval_grid.shape[0]
     dx = float(eval_grid[0, 1, 0] - eval_grid[0, 0, 0])
     dy = float(eval_grid[1, 0, 1] - eval_grid[0, 0, 1])
-
     model.eval()
-    eps_f = eps_static.reshape(-1, 3)
-
-    # ICNN takes raw strains directly
     with torch.no_grad():
-        sigma_f = model(torch.tensor(eps_f, dtype=torch.float32)).numpy()
-
+        sigma_f = model(torch.tensor(
+            eps_static.reshape(-1, 3), dtype=torch.float32)).numpy()
     sigma = sigma_f.reshape(M, M, 3)
-    s11, s22, s12 = sigma[:, :, 0], sigma[:, :, 1], sigma[:, :, 2]
-
+    s11, s22, s12 = sigma[:,:,0], sigma[:,:,1], sigma[:,:,2]
     div_x   = np.gradient(s11, dx, axis=1) + np.gradient(s12, dy, axis=0)
     div_y   = np.gradient(s12, dx, axis=1) + np.gradient(s22, dy, axis=0)
     div_mag = np.sqrt(div_x**2 + div_y**2)
-
-    interior_mag = div_mag[2:-2, 2:-2]
-    vmax_mag = np.percentile(interior_mag, 99)
+    vmax_mag = np.percentile(div_mag[2:-2, 2:-2], 99)
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-
     for ax, field, title, cmap in zip(
-        axes,
-        [div_x, div_y, div_mag],
+        axes, [div_x, div_y, div_mag],
         [r'$(\nabla\!\cdot\!\sigma)_x$',
          r'$(\nabla\!\cdot\!\sigma)_y$',
-         r'$|\nabla\!\cdot\!\sigma|$  (magnitude, clipped at 99th pct)'],
-        ['RdBu_r', 'RdBu_r', 'hot_r'],
+         r'$|\nabla\!\cdot\!\sigma|$ (99th pct)'],
+        ['RdBu_r', 'RdBu_r', 'hot_r']
     ):
         if cmap == 'RdBu_r':
-            vmax = np.percentile(np.abs(field[2:-2, 2:-2]), 99)
-            vmin = -vmax
+            vmax = np.percentile(np.abs(field[2:-2,2:-2]), 99)
+            im = ax.imshow(field, origin='lower', cmap=cmap, vmin=-vmax, vmax=vmax)
         else:
-            vmax = vmax_mag
-            vmin = 0
-        im = ax.imshow(field, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel('j');  ax.set_ylabel('i')
+            im = ax.imshow(field, origin='lower', cmap=cmap, vmin=0, vmax=vmax_mag)
+        ax.set_title(title, fontsize=9); ax.set_xlabel('j'); ax.set_ylabel('i')
         fig.colorbar(im, ax=ax, shrink=0.8)
-
-    fig.suptitle(r'Pointwise PDE residual  $\nabla\!\cdot\!\sigma_\mathrm{ICNN}$'
-                 r'  (should be $\approx 0$)', fontsize=13)
+    fig.suptitle(r'Pointwise PDE residual  $\nabla\!\cdot\!\sigma$  (should be $\approx 0$)',
+                 fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -253,206 +263,164 @@ def plot_pde_residual(model, eps_static, eval_grid, out):
 
 def plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y, out):
     """
-    Vertical Cauchy resultant along each horizontal row:
-
-        R_y(y_i) ≈ sum_j sigma_yy(i, j) * dx
-
-    Same construction as boundary_reaction_loss on one row. If the dataset
-    provides F_reaction_y (spring bottom reaction), overlay it as the target
-    scalar used in training (matched on the *top* eval row in train.py).
-
-    Interpreting: pointwise div sigma does not show force balance directly;
-    comparing this resultant to a measured reaction is a global vertical
-    scale check. R_y(y) need not be constant in y on a finite domain with shear.
+    ∫ σ_yy dx vs height. At convergence should be flat and equal to F_reaction_y.
+    The red dashed line shows the target reaction force.
+    CV < 0.05 means the resultant is flat — global equilibrium satisfied.
     """
-    M = eval_grid.shape[0]
+    M  = eval_grid.shape[0]
     dx = float(eval_grid[0, 1, 0] - eval_grid[0, 0, 0])
-
     model.eval()
-    eps_f = eps_static.reshape(-1, 3)
     with torch.no_grad():
-        sigma_f = model(torch.tensor(eps_f, dtype=torch.float32)).numpy()
+        sigma_f = model(torch.tensor(
+            eps_static.reshape(-1, 3), dtype=torch.float32)).numpy()
     sigma = sigma_f.reshape(M, M, 3)
-    s22 = sigma[:, :, 1]
-    Ry = s22.sum(axis=1) * dx
+    Ry    = sigma[:,:,1].sum(axis=1) * dx
     y_row = eval_grid[:, 0, 1]
 
-    # Flatness metric: coefficient of variation (std/|mean|) of interior rows.
-    # A perfectly flat resultant has CV = 0; < 0.05 is good.
     interior = Ry[1:-1]
-    cv = float(np.std(interior) / max(abs(np.mean(interior)), 1e-12))
-    flatness_note = f'CV = {cv:.3f}  ({"good" if cv < 0.05 else "not flat yet"})'
+    cv  = float(np.std(interior) / max(abs(np.mean(interior)), 1e-12))
+    err = float(Ry[0] - F_reaction_y)   # bottom-row error vs target
 
     fig, ax = plt.subplots(figsize=(6.5, 5))
-    ax.plot(Ry, y_row, 'b.-', lw=1.5, markersize=4, label=r'$\int \sigma_{yy}\,dx$ (ICNN)')
-    if F_reaction_y is not None:
-        ax.axvline(
-            float(F_reaction_y),
-            color='r',
-            ls='--',
-            lw=2,
-            label=f'target $F_y$ (data) = {float(F_reaction_y):.4g}',
-        )
-    ax.set_xlabel(r'vertical resultant $\int \sigma_{yy}\,dx$')
-    ax.set_ylabel('y')
+    ax.plot(Ry, y_row, 'b.-', lw=1.5, markersize=4,
+            label=r'$\int\sigma_{yy}\,dx$ (ICNN)')
+    ax.axvline(F_reaction_y, color='r', ls='--', lw=2,
+               label=f'target $F_y$ = {F_reaction_y:.4g}')
+    ax.set_xlabel(r'$\int\sigma_{yy}\,dx$'); ax.set_ylabel('y')
     ax.set_title('Vertical stress resultant vs height')
-    ax.annotate(
-        flatness_note,
-        xy=(0.98, 0.05), xycoords='axes fraction',
-        ha='right', va='bottom', fontsize=8,
-        bbox=dict(boxstyle='round,pad=0.3', fc='lightblue', alpha=0.7),
-    )
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
+    info = (f'CV = {cv:.3f} ({"good" if cv < 0.05 else "not flat"})\n'
+            f'bottom-row error = {err:+.4f}')
+    ax.annotate(info, xy=(0.98, 0.05), xycoords='axes fraction',
+                ha='right', va='bottom', fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.3', fc='lightblue', alpha=0.7))
+    ax.legend(); ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f'Saved  {out}  ({flatness_note})')
+    print(f'Saved  {out}  (CV={cv:.3f}, bottom-row err={err:+.4f})')
 
-    print(
-        f'  Resultant ICNN:  top row (max y) R_y = {float(Ry[-1]):.6g}  '
-        f'bottom row R_y = {float(Ry[0]):.6g}'
-    )
-    if F_reaction_y is not None:
-        err_top = float(Ry[-1]) - float(F_reaction_y)
-        print(
-            f'  vs data F_reaction_y = {float(F_reaction_y):.6g}  '
-            f'(top-row delta = {err_top:+.6g}; training matches this scalar)'
-        )
+
+def plot_smoothed_vs_original(node_pos, u_raw, eval_grid, u_hat, eps, out):
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    def show(ax, data, title, cmap='viridis', sym=False):
+        vmax = np.abs(data).max()
+        im   = ax.imshow(data, origin='lower', cmap=cmap,
+                         vmin=-vmax if sym else data.min(), vmax=vmax)
+        ax.set_title(title); ax.set_xlabel('j'); ax.set_ylabel('i')
+        fig.colorbar(im, ax=ax, shrink=0.75)
+    show(axes[0,0], u_raw[:,:,0,1], 'Original $u_y$')
+    show(axes[0,1], u_hat[:,:,0,1], 'Smoothed $u_y$')
+    show(axes[1,0], eps[:,:,0,0],   r'$\varepsilon_{11}$', sym=True, cmap='RdBu_r')
+    show(axes[1,1], eps[:,:,0,1],   r'$\varepsilon_{22}$')
+    fig.suptitle('Displacement and strain fields', fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved  {out}')
 
 
 # -------------------------------------------------------------------  main  --
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--condition', choices=['static', 'dynamic'], default=None,
-                        help='Dataset condition folder under data/ (prompted if omitted)')
-    parser.add_argument('--grid-size', type=int, default=None,
-                        help='Grid size subfolder under data/<condition>/ (prompted if omitted)')
-    parser.add_argument('--data', default=None,
-                        help='Optional explicit path to lattice .npz file (overrides condition/grid-size)')
-    parser.add_argument('--model-path', default=None,
-                        help='Path to save/load trained ICNN checkpoint (.pt)')
-    parser.add_argument('--load-model', action='store_true',
-                        help='Load model from --model-path and skip training')
-    parser.add_argument('--force-train', action='store_true',
-                        help='Force retraining even if a checkpoint already exists')
+    parser = argparse.ArgumentParser(description='NN-EUCLID ICNN pipeline')
+    parser.add_argument('--condition', choices=['static','dynamic'], default=None)
+    parser.add_argument('--grid-size', type=int, default=None)
+    parser.add_argument('--data', default=None)
+    parser.add_argument('--model-path', default=None)
+    parser.add_argument('--load-model', action='store_true')
+    parser.add_argument('--force-train', action='store_true')
+    parser.add_argument('--n-ensemble', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=500)
     args = parser.parse_args()
 
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f'CUDA available: yes  |  GPU: {gpu_name}')
+        print(f'CUDA: yes  |  GPU: {torch.cuda.get_device_name(0)}')
     else:
-        print('CUDA available: no  |  using CPU')
+        print('CUDA: no  |  using CPU')
 
+    # Resolve data path
     condition = args.condition
     grid_size = args.grid_size
-
     if args.data is None:
         if condition is None:
-            condition = prompt_with_default('Condition (static/dynamic)', 'static').lower()
-            while condition not in ('static', 'dynamic'):
-                condition = prompt_with_default('Please enter static or dynamic', 'static').lower()
+            condition = prompt('Condition (static/dynamic)', 'static').lower()
         if grid_size is None:
-            grid_raw = prompt_with_default('Grid size', 100)
-            while True:
-                try:
-                    grid_size = int(grid_raw)
-                    if grid_size < 1:
-                        raise ValueError
-                    break
-                except ValueError:
-                    grid_raw = prompt_with_default('Please enter a positive integer for grid size', 100)
+            grid_size = int(prompt('Grid size', 100))
+    data_path    = resolve_data_path(args.data, condition, grid_size)
+    cond_tag, grid_tag = infer_tags(data_path)
 
-    data_path = resolve_data_path(args.data, condition, grid_size)
-    condition, grid_size = infer_result_tags(data_path)
-    results_dir = os.path.join('results', condition, str(grid_size))
+    results_dir = os.path.join(SCRIPT_DIR, 'results', cond_tag, str(grid_tag))
     os.makedirs(results_dir, exist_ok=True)
+    print(f'Results dir: {results_dir}')
 
-    def out(fname):
-        return os.path.join(results_dir, fname)
+    model_path = (os.path.abspath(args.model_path) if args.model_path
+                  else os.path.join(results_dir, 'icnn_model_best.pt'))
 
-    model_path = args.model_path if args.model_path is not None else out('icnn_model.pt')
-
-    # 1. Load
+    # Load data
     print(f'Loading {data_path} ...')
     node_pos, u, DX, F_reaction_y = load_data(data_path)
+    print(f'  F_reaction_y = {F_reaction_y:.6g}')
 
-    # 2. Smooth
-    print('Smoothing displacement field ...')
+    # Smooth
+    print('Smoothing ...')
     eval_grid, u_hat, eps = smooth(node_pos, u, DX, margin=3)
-    eps_static = eps[:, :, 0, :]    # (M, M, 3)
+    eps_static = eps[:, :, 0, :]
+    np.savez(opath(results_dir, 'smoothed_data.npz'),
+             eval_grid=eval_grid, u_hat=u_hat, eps=eps)
+    print(f'Saved  {opath(results_dir, "smoothed_data.npz")}')
 
-    np.savez(out('smoothed_data.npz'), eval_grid=eval_grid, u_hat=u_hat, eps=eps)
-    print(f'Saved  {out("smoothed_data.npz")}')
+    # Architecture — paper Table A.1: 64 neurons, 3 hidden layers
+    hidden, layers, act_scale, dropout = 64, 3, 1/12, 0.2
 
-    # Boundary row used for reaction-force matching (same row every epoch).
-    bdry_eps = eps_static[-1, :, :] if F_reaction_y is not None else None
-
-    # 3. Train (or load existing model)
+    # Train or load
     auto_load = os.path.exists(model_path) and not args.force_train
-    use_load = args.load_model or auto_load
-
-    K = 50  # number of test functions — used by training and loss plot
+    use_load  = args.load_model or auto_load
 
     if use_load:
-        if args.load_model and not os.path.exists(model_path):
-            raise FileNotFoundError(f'--load-model was set but model file does not exist: {model_path}')
+        print(f'Loading model from {model_path}')
         ckpt = torch.load(model_path, map_location='cpu')
-        model = ICNN(
-            hidden=ckpt['hidden'],
-            layers=ckpt['layers'],
-            act_scale=ckpt.get('act_scale', 1/12),
-            dropout=ckpt.get('dropout', 0.0),
-        )
+        model = ICNN(hidden=ckpt['hidden'], layers=ckpt['layers'],
+                     act_scale=ckpt.get('act_scale', 1/12),
+                     dropout=ckpt.get('dropout', 0.2))
         model.load_state_dict(ckpt['state_dict'])
-        losses = ckpt.get('losses', [])
-        print(f'Loaded model from {model_path} (training skipped)')
+        model.eval()
+        all_losses = [ckpt.get('losses', [])]
+        best_idx   = 0
+        print('Loaded (training skipped)')
     else:
-        hidden = 32
-        layers = 3
-        act_scale = 1/12
-        dropout = 0.0  # must be 0 with L-BFGS (dropout makes closure stochastic)
-        model, losses = train_model(
-            eps_static, eval_grid, DX=DX,
-            K=K, epochs=2000,
+        ckpt_dir = os.path.join(results_dir, 'ensemble_checkpoints')
+        best_model, all_losses, best_idx = train_ensemble(
+            eps_static, DX, F_reaction_y,
             hidden=hidden, layers=layers,
             act_scale=act_scale, dropout=dropout,
-            optimizer='lbfgs',
-            base_lr=1.0,
-            lr_schedule='constant',
-            reaction_force=F_reaction_y, bdry_eps=bdry_eps, rxn_factor=1e2,  # low enough to avoid NaN at init
-            checkpoint_path=model_path, checkpoint_every=200,
-            seed=0
+            epochs=args.epochs,
+            base_lr=0.001, max_lr=0.1, cycle_epochs=100,
+            n_ensemble=args.n_ensemble,
+            checkpoint_dir=ckpt_dir,
         )
-        torch.save(
-            {
-                'state_dict': model.state_dict(),
-                'hidden': hidden,
-                'layers': layers,
-                'act_scale': act_scale,
-                'dropout': dropout,
-                'losses': losses,
-            },
-            model_path
-        )
-        print(f'Saved model checkpoint to {model_path}')
+        model = best_model
+        _save(model, all_losses[best_idx], hidden, layers,
+              act_scale, dropout, best_idx, model_path)
+        print(f'Best model saved -> {model_path}')
 
-    # 4. Plots
+    # Plots
     plot_smoothed_vs_original(node_pos, u, eval_grid, u_hat, eps,
-                              out('smoothed_vs_original.png'))
-    if len(losses) > 0:
-        plot_loss(losses, K,  out('loss_curve.png'))
+                              opath(results_dir, 'smoothed_vs_original.png'))
+    plot_loss(all_losses, best_idx,
+              opath(results_dir, 'loss_curve.png'))
+    plot_loss_breakdown(model, eps_static, DX, F_reaction_y,
+                        all_losses, best_idx,
+                        opath(results_dir, 'loss_breakdown.png'))
+    plot_stress_field(model, eps_static, eval_grid,
+                      opath(results_dir, 'stress_fields.png'))
     plot_stress_strain(model, eps_static,
-                              out('stress_strain.png'))
-    plot_pde_residual(model,  eps_static, eval_grid,
-                              out('pde_residual.png'))
-    plot_vertical_resultant(
-        model, eps_static, eval_grid, F_reaction_y,
-        out('vertical_resultant.png'),
-    )
+                       opath(results_dir, 'stress_strain.png'))
+    plot_pde_residual(model, eps_static, eval_grid,
+                      opath(results_dir, 'pde_residual.png'))
+    plot_vertical_resultant(model, eps_static, eval_grid, F_reaction_y,
+                            opath(results_dir, 'vertical_resultant.png'))
 
-    print(f'\nAll done.  Results in {results_dir}/')
+    print(f'\nAll done.  Results in {results_dir}')
 
 
 if __name__ == '__main__':

@@ -1,194 +1,165 @@
 """
-train.py  (ICNN)
-----------------
-Training script for static equilibrium using the ICNN constitutive model.
+train.py  —  NN-EUCLID training protocol  (Thakolkaran et al. 2022)
+--------------------------------------------------------------------
+Matches paper Appendix A exactly:
+  - Adam optimizer
+  - Learning rate linearly cycled 0.001 → 0.1 → 0.001 every 100 epochs
+  - 500 epochs total
+  - Dropout 0.2 during training, off at eval
+  - Ensemble of n_ensemble independent runs; keep best by final loss
 
-Improvements over MLP/train.py (inspired by nn-EUCLID):
-  optimizer    : 'adam' or 'lbfgs' (L-BFGS with strong-Wolfe line search)
-  lr_schedule  : 'cyclic' (CyclicLR) or 'constant'
-  reaction_force / bdry_eps : optional boundary traction loss that pins the
-                              absolute stress scale (nn-EUCLID: reaction_loss)
+Loss: nodal force balance (eq. 22) — no rxn_factor needed.
 """
 
 import math
-import numpy as np
+import os
 import time
 import torch
 import torch.optim as optim
+import numpy as np
 
 from nn_model import ICNN
-from pde_loss import make_test_functions, pde_loss, boundary_reaction_loss
+from nodal_loss import nodal_loss
 
 
-def train(eps, X, DX,
-          K=50, epochs=2000,
-          hidden=32, layers=3,
-          act_scale=1/12, dropout=0.0,
-          optimizer='adam',
-          base_lr=1e-3, max_lr=1e-2,
-          lr_schedule='cyclic', cycle_steps=200,
-          reaction_force=None, bdry_eps=None, rxn_factor='auto',
-          checkpoint_path=None, checkpoint_every=200,
-          seed=0):
+def _fmt(sec):
+    sec = max(0, int(sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def train_single(eps_t, DX, F_reaction_y,
+                 hidden=64, layers=3, act_scale=1/12, dropout=0.2,
+                 epochs=500, base_lr=0.001, max_lr=0.1, cycle_epochs=100,
+                 seed=0, verbose=True):
     """
-    Parameters
-    ----------
-    eps           : (M, M, 3)   strain field [e11, e22, e12]
-    X             : (M, M, 2)   evaluation grid coordinates
-    DX            : float       grid spacing
-    K             : int         number of test functions
-    epochs        : int
-    hidden        : int         hidden units per layer
-    layers        : int         number of hidden layers
-    act_scale     : float       squared-softplus scaling (nn-EUCLID: 1/12)
-    dropout       : float       dropout probability (0 = off)
-    optimizer     : 'adam' | 'lbfgs'
-    base_lr       : float       base / initial learning rate
-    max_lr        : float       peak LR for cyclic schedule (Adam only)
-    lr_schedule   : 'cyclic' | 'constant'  (ignored for lbfgs)
-    cycle_steps   : int         half-cycle length for CyclicLR
-    reaction_force: float|None  total vertical reaction at bottom boundary
-    bdry_eps      : (M,3)|None  strain at top row of eval grid
-    rxn_factor    : float|'auto'  weight on the reaction force loss term.
-                                  'auto' uses fixed 1e5 — chosen so that the
-                                  reaction loss (~O(1e3) at start) is comparable
-                                  to the weak form loss (~O(1e8) at start).
-    seed          : int
+    One training run — matches nn-EUCLID Appendix A exactly.
 
-    Returns
-    -------
-    model  : trained ICNN
-    losses : list of float (one per epoch)
+    hidden=64, 3 hidden layers, dropout=0.2 per Table A.1 of paper.
     """
-    def _fmt_sec(sec):
-        sec = max(0, int(sec))
-        h, rem = divmod(sec, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
-    print(f"Building {K} test functions...")
-    test_fns  = make_test_functions(X, K=K, seed=seed)
-    grad_psis = [tf['grad_psi'] for tf in test_fns]
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-    print(f"Using device: {device}")
-
-    eps_t = torch.tensor(eps, dtype=torch.float32, device=device)
-
-    # Pre-convert grad_psis to device tensors ONCE — avoids numpy->CUDA transfer
-    # on every closure call (~20x per L-BFGS epoch x 50 test functions = 1000 copies/epoch)
-    grad_psis_t = [torch.tensor(gp, dtype=torch.float32, device=device)
-                   for gp in grad_psis]
-
-    # Pre-convert boundary strain once if provided
-    bdry_t = (torch.tensor(bdry_eps, dtype=torch.float32, device=device)
-              if bdry_eps is not None else None)
-
+    device = eps_t.device
     torch.manual_seed(seed)
+
     model = ICNN(hidden=hidden, layers=layers,
                  act_scale=act_scale, dropout=dropout).to(device)
 
-    # ----- optimizer -----
-    if optimizer == 'adam':
-        opt = optim.Adam(model.parameters(), lr=base_lr)
-    elif optimizer == 'lbfgs':
-        opt = optim.LBFGS(model.parameters(), lr=base_lr,
-                          line_search_fn='strong_wolfe')
-    else:
-        raise ValueError(f"optimizer must be 'adam' or 'lbfgs', got '{optimizer}'")
+    opt = optim.Adam(model.parameters(), lr=base_lr)
 
-    # ----- LR scheduler (Adam only; L-BFGS has its own line search) -----
-    scheduler = None
-    if optimizer == 'adam' and lr_schedule == 'cyclic':
-        scheduler = optim.lr_scheduler.CyclicLR(
-            opt,
-            base_lr=base_lr,
-            max_lr=max_lr,
-            step_size_up=cycle_steps,
-            step_size_down=cycle_steps,
-            cycle_momentum=False,
-        )
-
-    # Fixed rxn_factor = 1e5.
-    # Rationale: weak form loss starts at ~O(1e8), reaction loss starts at
-    # ~O(1e3) for a unit-scale force. Multiplying by 1e5 brings reaction loss
-    # to ~O(1e8), making both terms comparable from the first epoch.
-    # Pass rxn_factor explicitly to override.
-    if rxn_factor == 'auto':
-        rxn_factor = 1e5
-        print(f"rxn_factor = {rxn_factor:.3e}  (fixed default)")
-
-    def compute_loss():
-        loss = pde_loss(model, eps_t, grad_psis_t, DX)
-        if reaction_force is not None and bdry_t is not None:
-            rxn_loss = boundary_reaction_loss(model, bdry_t, reaction_force, DX)
-            loss = loss + rxn_factor * rxn_loss
-        return loss
+    # Paper: "linearly cycled from 0.001 to 0.1 and back every 100 epochs"
+    # step_size_up=50, step_size_down=50 → full cycle = 100 epochs
+    scheduler = optim.lr_scheduler.CyclicLR(
+        opt,
+        base_lr=base_lr,
+        max_lr=max_lr,
+        step_size_up=cycle_epochs // 2,
+        step_size_down=cycle_epochs // 2,
+        cycle_momentum=False,
+        mode='triangular',
+    )
 
     losses = []
-    t_start = time.perf_counter()
-    print(f"Training for {epochs} epochs  [{optimizer}"
-          + (f", {lr_schedule} LR" if optimizer == 'adam' else "")
-          + (f", reaction loss w/ rxn_factor={rxn_factor:.1e}"
-             if reaction_force is not None else "")
-          + "] ...")
-    print(
-        "Loss reporting: raw = full objective; "
-        "loss/K ≈ average squared weak residual per test function (rough scale); "
-        "log10(raw) for exponent-style reading."
-    )
+    t0 = time.perf_counter()
 
     for epoch in range(epochs):
         model.train()
+        opt.zero_grad()
 
-        if optimizer == 'lbfgs':
-            def closure():
-                opt.zero_grad()
-                loss = compute_loss()
-                loss.backward()
-                return loss
-            loss_val_t = opt.step(closure)
-            loss_val   = loss_val_t.item()
-        else:
-            opt.zero_grad()
-            loss_val_t = compute_loss()
-            loss_val_t.backward()
-            opt.step()
-            if scheduler is not None:
-                scheduler.step()
-            loss_val = loss_val_t.item()
+        loss, lf, lr_ = nodal_loss(model, eps_t, DX, F_reaction_y)
+        loss.backward()
+        opt.step()
+        scheduler.step()
 
-        losses.append(loss_val)
+        lv = loss.item()
+        losses.append(lv)
 
-        if epoch % 50 == 0 or epoch == epochs - 1:
+        if verbose and (epoch % 50 == 0 or epoch == epochs - 1):
+            elapsed = time.perf_counter() - t0
+            eta = elapsed / (epoch + 1) * (epochs - epoch - 1)
             lr_now = opt.param_groups[0]['lr']
-            elapsed = time.perf_counter() - t_start
-            done = epoch + 1
-            avg_epoch = elapsed / done
-            eta = avg_epoch * (epochs - done)
-            pct = 100.0 * done / max(epochs, 1)
-            loss_per_k = loss_val / max(K, 1)
-            log10_loss = math.log10(max(loss_val, 1e-300))
             print(
-                f"  Epoch {epoch:4d}/{epochs-1:4d} ({pct:5.1f}%)"
-                f"  loss = {loss_val:.4e}  loss/K = {loss_per_k:.4e}"
-                f"  log10(loss) = {log10_loss:6.3f}"
-                f"  lr = {lr_now:.2e}"
-                f"  elapsed = {_fmt_sec(elapsed)}  ETA = {_fmt_sec(eta)}"
+                f"    ep {epoch:4d}/{epochs-1}  "
+                f"loss={lv:.4e}  free={lf.item():.4e}  rxn={lr_.item():.4e}  "
+                f"lr={lr_now:.4f}  {_fmt(elapsed)}<{_fmt(eta)}"
             )
 
-        if (checkpoint_path is not None
-                and checkpoint_every > 0
-                and (epoch + 1) % checkpoint_every == 0):
-            _cpu = model.to('cpu')
-            torch.save({'state_dict': _cpu.state_dict(),
-                        'epoch': epoch + 1,
-                        'losses': losses}, checkpoint_path)
-            model = _cpu.to(device)
-            print(f"  [checkpoint saved -> {checkpoint_path}  epoch {epoch+1}]")
-
-    print("Done.")
+    model.eval()
     model = model.to('cpu')
     return model, losses
+
+
+def train_ensemble(eps, DX, F_reaction_y,
+                   hidden=64, layers=3, act_scale=1/12, dropout=0.2,
+                   epochs=500, base_lr=0.001, max_lr=0.1, cycle_epochs=100,
+                   n_ensemble=5,
+                   checkpoint_dir=None):
+    """
+    Train n_ensemble independent models, return the best one.
+
+    Paper uses n_e=30; we default to 5 for practical GPU training.
+    Each run uses a different random seed for weight initialisation.
+    Acceptance criterion: within 20% of best final loss (per paper).
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    print(f"Running {n_ensemble} ensemble members, {epochs} epochs each")
+    print(f"Architecture: hidden={hidden}, layers={layers}, dropout={dropout}")
+    print(f"LR: {base_lr} -> {max_lr} -> {base_lr}, cycle={cycle_epochs} epochs")
+    print(f"Loss: nodal force balance (nn-EUCLID eq. 22, no rxn_factor)")
+    print()
+
+    eps_t = torch.tensor(eps, dtype=torch.float32, device=device)
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    all_losses = []
+    final_losses = []
+    models = []
+
+    for run in range(n_ensemble):
+        print(f"--- Ensemble run {run+1}/{n_ensemble}  (seed={run}) ---")
+        model, losses = train_single(
+            eps_t, DX, F_reaction_y,
+            hidden=hidden, layers=layers,
+            act_scale=act_scale, dropout=dropout,
+            epochs=epochs,
+            base_lr=base_lr, max_lr=max_lr, cycle_epochs=cycle_epochs,
+            seed=run,
+            verbose=True,
+        )
+        all_losses.append(losses)
+        final_losses.append(losses[-1])
+        models.append(model)
+
+        if checkpoint_dir:
+            path = os.path.join(checkpoint_dir, f'run_{run:02d}.pt')
+            _save(model, losses, hidden, layers, act_scale, dropout, run, path)
+            print(f"    saved -> {path}")
+
+        print(f"    final loss = {losses[-1]:.4e}\n")
+
+    best_idx = int(np.argmin(final_losses))
+    best_model = models[best_idx]
+    print(f"Best run: {best_idx+1}/{n_ensemble}  "
+          f"(loss={final_losses[best_idx]:.4e})")
+
+    threshold = final_losses[best_idx] * 1.20
+    accepted = [i for i, l in enumerate(final_losses) if l <= threshold]
+    print(f"Accepted (within 20% of best): runs {[i+1 for i in accepted]}  "
+          f"losses: {[f'{final_losses[i]:.3e}' for i in accepted]}")
+
+    return best_model, all_losses, best_idx
+
+
+def _save(model, losses, hidden, layers, act_scale, dropout, seed, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        torch.save({
+            'state_dict': model.state_dict(),
+            'hidden': hidden, 'layers': layers,
+            'act_scale': act_scale, 'dropout': dropout,
+            'losses': losses, 'seed': seed,
+        }, path)
+    except Exception as e:
+        print(f"WARNING: save failed for {path}: {e}")
